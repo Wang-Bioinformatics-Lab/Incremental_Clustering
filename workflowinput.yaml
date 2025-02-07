@@ -1,0 +1,21 @@
+workflowname: template_nextflow_workflow
+workflowdescription: template_nextflow_workflow
+workflowlongdescription: This is a template nextflow workflow for GNPS2
+workflowversion: "0.1"
+workflowfile: nf_workflow.nf
+workflowautohide: false
+adminonly: false
+#This maps the parameters from an input form to those that will appear in nextflow
+parameterlist:
+    - displayname: File Selection
+      paramtype: section
+
+    - displayname: Input Data Folder
+      paramtype: fileselector
+      nf_paramname: input_spectra
+      formplaceholder: Enter the path to data
+      formvalue: ""
+      targettaskfolder: input_spectra
+      optional: false
+      selectsinglefile: false
+      folderunroll: true

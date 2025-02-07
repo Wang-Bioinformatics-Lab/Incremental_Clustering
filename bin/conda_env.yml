@@ -1,0 +1,11 @@
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.13
+  - pandas>=2.2.0
+  - numpy>=2.0.0
+  - pip:
+    - xmltodict
+    - requests
+    - pyteomics
