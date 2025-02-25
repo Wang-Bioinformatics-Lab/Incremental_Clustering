@@ -1,19 +1,21 @@
-name: template_nextflow_workflow
+name: incremental_clustering_nextflow_workflow
 displayname: STUFF
 Views:
--   name: Summary List
-    displayname: Summary List
-    viewname: summarylist
-    displaytype: datatable
+-   name: Clustering Output List
+    displayname: Clustering output List
+    viewname: outputlist
+    displaytype: datatable_serverbig
     parameters:
-        filename: output/summary.tsv
+        filename: results/cluster_info.tsv
         columns:
-            -   title: "View LCMS"
-                data: filename
+            -   title: "precursor_mz"
+                data: precursor_mz
+            -   title: "retention_time"
+                data: retention_time
+            -   title: "cluster"
+                data: cluster
             -   title: "filename"
                 data: filename
-        columnDefs: '[ {"targets": 0,"data": null,"render": function ( data, type, row, meta ) {
-            return `
-            <a target="_blank" href="/dashboards/lcms?usi=mzspec:GNPS2-${task}:${encodeURIComponent(row["filename"])}">View LCMS - mzspec:GNPS2-${task}:${row["filename"]}</a>
-            `;}}]'
-            
+            -   title: "scan"
+                data: scan
+

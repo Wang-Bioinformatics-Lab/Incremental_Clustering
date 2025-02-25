@@ -1,6 +1,6 @@
-workflowname: template_nextflow_workflow
-workflowdescription: template_nextflow_workflow
-workflowlongdescription: This is a template nextflow workflow for GNPS2
+workflowname: incremental_clustering_nextflow_workflow
+workflowdescription: incremental_clustering_nextflow_workflow
+workflowlongdescription: This is the incremental_clustering_nextflow_workflow
 workflowversion: "0.1"
 workflowfile: nf_workflow.nf
 workflowautohide: false
@@ -19,3 +19,14 @@ parameterlist:
       optional: false
       selectsinglefile: false
       folderunroll: true
+
+    - displayname: Input Checkpoint Folder
+      paramtype: fileselector
+      nf_paramname: checkpoint_dir
+      formplaceholder: Enter the path to previous batch results folder
+      formvalue: ""
+      targettaskfolder: checkpoint_dir
+      optional: True
+      selectsinglefile: false
+      folderunroll: true
+
