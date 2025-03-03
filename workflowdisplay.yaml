@@ -19,3 +19,19 @@ Views:
             -   title: "scan"
                 data: scan
 
+-   name: section
+    displayname: Downstream Analysis
+    viewname: section
+    displaytype: section
+
+-   name: Downstream Analysis - Incremental Clustering Batch
+    displayname: Downstream Analysis - Run Incremental Clustering Batch
+    viewname: downstreamtransitive
+    displaytype: linkout
+    parameters:
+        baseurl: /workflowinput
+        urlparam:
+            -   workflowname:incremental_clustering_nextflow_workflow
+        hashparam:
+            -   checkpoint_dir:TASKLOCATION/[task]/results/
+

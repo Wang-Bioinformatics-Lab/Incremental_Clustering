@@ -30,3 +30,40 @@ parameterlist:
       selectsinglefile: false
       folderunroll: true
 
+    - displayname: General Parameters
+      paramtype: section
+
+    - displayname: Precursor Ion Tolerance
+      paramtype: text
+      nf_paramname: precursor_tol
+      formplaceholder: Enter the precursor_tol
+      formvalue: "20 ppm"
+      tooltip: "precursor_tol ppm or Da"
+
+    - displayname: Fragment Ion Tolerance
+      paramtype: text
+      nf_paramname: fragment_tol
+      formplaceholder: Enter the fragment_tolerance
+      formvalue: "0.05"
+      tooltip: "fragment_tolerance"
+
+    - displayname: Min Peak Intensity
+      paramtype: text
+      nf_paramname: min_mz
+      formplaceholder: Enter the min_mz
+      formvalue: "0"
+      tooltip: "min_mz"
+
+    - displayname: Max Peak Intensity
+      paramtype: text
+      nf_paramname: max_mz
+      formplaceholder: Enter the max_mz
+      formvalue: "30000"
+      tooltip: "max_mz"
+
+    - displayname: EPS parameter for DBSCAN clustering
+      paramtype: text
+      nf_paramname: eps
+      formplaceholder: Enter the eps
+      formvalue: "0.1"
+      tooltip: "clustering sensitivity"

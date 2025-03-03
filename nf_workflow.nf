@@ -9,6 +9,14 @@ TOOL_FOLDER = "$baseDir/bin"
 params.output_dir = "$baseDir/results"
 params.checkpoint_dir  = "$baseDir/checkpoint"
 
+// Falcon parameters with defaults
+params.precursor_tol = "20 ppm"
+params.fragment_tol = 0.05
+params.min_mz_range = 0
+params.min_mz = 0
+params.max_mz = 30000
+params.eps = 0.1
+
 
 
 
@@ -32,7 +40,13 @@ process CLUSTERING {
         --folder $input \
         --checkpoint_dir "${params.checkpoint_dir}" \
         --output_dir results \
-        --tool_dir $TOOL_FOLDER
+        --tool_dir $TOOL_FOLDER \
+        --precursor_tol "${params.precursor_tol}" \
+        --fragment_tol ${params.fragment_tol} \
+        --min_mz_range ${params.min_mz_range} \
+        --min_mz ${params.min_mz} \
+        --max_mz ${params.max_mz} \
+        --eps ${params.eps}
     """
 }
 

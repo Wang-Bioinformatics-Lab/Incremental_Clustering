@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-
+import time
 import os
 import sys
 import argparse
@@ -25,19 +25,19 @@ import gc
 # 1) FALCON + SUMMARIZE + MZML READ/WRITE FUNCTIONS
 ##############################################################################
 
-def run_falcon(mzml_pattern, output_prefix="falcon"):
+def run_falcon(mzml_pattern, output_prefix="falcon", precursor_tol="20 ppm", fragment_tol=0.05,
+               min_mz_range=0, min_mz=0, max_mz=30000, eps=0.1):
     """
-    Runs Falcon on the given *.mzML pattern, specifying an output prefix (e.g. "falcon").
-    Adjust the command arguments as needed.
+    Runs Falcon with specified parameters.
     """
     command = (
         f"falcon {mzml_pattern} {output_prefix} "
         f"--export_representatives "
-        f"--precursor_tol 20 ppm "
-        f"--fragment_tol 0.05 "
-        f"--min_mz_range 0 "
-        f"--min_mz 0 --max_mz 30000 "
-        f"--eps 0.1"
+        f"--precursor_tol {precursor_tol} "
+        f"--fragment_tol {fragment_tol} "
+        f"--min_mz_range {min_mz_range} "
+        f"--min_mz {min_mz} --max_mz {max_mz} "
+        f"--eps {eps}"
     )
     print(f"[run_falcon] Running: {command}")
     process = subprocess.Popen(command, shell=True)
@@ -65,7 +65,7 @@ def read_mzml(filepath):
     """
     spectra = []
     run = pymzml.run.Reader(filepath, build_index_from_scratch=True)
-    for spectrum in tqdm(run, desc=f"Reading {os.path.basename(filepath)}", unit="spec"):
+    for spectrum in run:
         if spectrum['ms level'] == 2:
             spectrum_dict = {
                 'peaks': [],
@@ -284,35 +284,67 @@ def load_cluster_dic_hdf5_optimized(in_path):
 
 def initial_cluster_dic(cluster_info_tsv, falcon_mgf, spectra_dic):
     """
-    Create a cluster_dic from scratch, given the output:
-      - cluster_info.tsv from summarize_results.py
-      - falcon.mgf from falcon
-      - spectra_dic (the full dictionary of all ms2 spectra in the folder)
+    Create a cluster_dic from scratch, handling cluster IDs:
+    - Non-`-1` clusters retain their original IDs.
+    - `-1` clusters get new sequential IDs.
     """
     cluster_dic = {}
+    current_max_id = 0  # Track the highest cluster ID
+
+    # Split rows into non-neg and neg clusters
+    non_neg_rows = []
+    neg_rows = []
     with open(cluster_info_tsv, 'r') as csvfile:
         rdr = csv.DictReader(csvfile, delimiter='\t')
         for row in rdr:
             cid = int(row['cluster'])
-            fn = row['filename']
-            sc = int(row['scan'])
-            pmz= row['precursor_mz']
-            rt = row['retention_time']
-            # find corresponding spec
-            base = os.path.splitext(os.path.basename(fn))[0]
-            sp_key = (base, sc)
-            sp_data = spectra_dic[sp_key]
-            if cid not in cluster_dic:
-                cluster_dic[cid] = {'scan_list':[], 'spec_pool':[]}
-            cluster_dic[cid]['scan_list'].append((fn, sc, pmz, rt))
-            cluster_dic[cid]['spec_pool'].append(sp_data)
+            if cid != -1:
+                non_neg_rows.append(row)
+                current_max_id = max(current_max_id, cid)  # Track max ID
+            else:
+                neg_rows.append(row)
 
-    # attach falcon mgf reps
+    # Process non-neg clusters (original IDs)
+    for row in non_neg_rows:
+        cid = int(row['cluster'])
+        fn = row['filename']
+        sc = int(row['scan'])
+        pmz = row['precursor_mz']
+        rt = row['retention_time']
+        base = os.path.splitext(os.path.basename(fn))[0]
+        sp_data = spectra_dic[(base, sc)]
+
+        if cid not in cluster_dic:
+            cluster_dic[cid] = {'scan_list': [], 'spec_pool': []}
+        cluster_dic[cid]['scan_list'].append((fn, sc, pmz, rt))
+        cluster_dic[cid]['spec_pool'].append(sp_data)
+
+    # Process neg clusters (assign new IDs sequentially)
+    for row in neg_rows:
+        current_max_id += 1
+        new_cid = current_max_id
+        fn = row['filename']
+        sc = int(row['scan'])
+        pmz = row['precursor_mz']
+        rt = row['retention_time']
+        base = os.path.splitext(os.path.basename(fn))[0]
+        sp_data = spectra_dic[(base, sc)]
+
+        cluster_dic[new_cid] = {
+            'scan_list': [(fn, sc, pmz, rt)],
+            'spec_pool': [sp_data],
+            'spectrum': sp_data  # Initial representative
+        }
+
+    # Attach Falcon MGF reps (use original IDs directly)
     mgf_spectra = read_mgf(falcon_mgf)
-    for s in mgf_spectra:
-        c_id = int(s['cluster'])
-        cluster_dic[c_id]['spectrum'] = s
-        cluster_dic[c_id]['title'] = s['title']
+    for spectrum in mgf_spectra:
+        original_cid = int(spectrum['cluster'])
+        if original_cid in cluster_dic:
+            cluster_dic[original_cid]['spectrum'] = spectrum
+            cluster_dic[original_cid]['title'] = spectrum['title']
+        else:
+            print(f"Cluster {original_cid} not found, skipping.")
 
     return cluster_dic
 
@@ -400,7 +432,7 @@ def update_cluster_dic(cluster_dic, cluster_info_tsv, falcon_mgf, spectra_dic):
 # 4) DRIVER LOGIC: ONE FOLDER AT A TIME
 ##############################################################################
 
-def cluster_one_folder(folder, checkpoint_dir,output_dir,tool_dir):
+def cluster_one_folder(folder, checkpoint_dir, output_dir, tool_dir, precursor_tol, fragment_tol, min_mz_range, min_mz, max_mz, eps):
     """
     Given a single folder that has *.mzML files,
     - if 'cluster_dic.h5' doesn't exist => run initial clustering
@@ -424,19 +456,46 @@ def cluster_one_folder(folder, checkpoint_dir,output_dir,tool_dir):
         input_files = f"{folder}/*.mzML"
         print(f"[cluster_one_folder] No consensus file found; proceeding with folder mzML files only.")
 
+    start_time = time.time()
+
     # 1) RUN FALCON on the folder's *.mzML
-    run_falcon(input_files, "falcon")
+    run_falcon(
+        input_files,
+        "falcon",
+        precursor_tol=precursor_tol,
+        fragment_tol=fragment_tol,
+        min_mz_range=min_mz_range,
+        min_mz=min_mz,
+        max_mz=max_mz,
+        eps=eps
+    )
+
+    falcon_end_time = time.time()
+
+    print(f"Falcon clustering took {falcon_end_time- start_time:.2f} s.")
 
     # Build a dictionary of the spectra in this folder
     print(f"[cluster_one_folder] Building spectra dict for folder: {folder}")
     folder_spec_dic = read_mzml_parallel(folder)
 
+    mzml_end_time = time.time()
+
+    print(f"Reading files took {mzml_end_time - falcon_end_time:.2f} s.")
+
     # Read existing cluster_dic (if any)
+
     cluster_dic = load_cluster_dic_hdf5_optimized(cluster_dic_path)
     has_checkpoint = (len(cluster_dic) > 0)
 
+    cluster_dic_load_time = time.time()
+
+    print(f"Loading clustering dic took {cluster_dic_load_time - mzml_end_time:.2f} s.")
+
     # 2) Summarize => we get cluster_info.tsv
     cluster_info_tsv = summarize_output(output_dir,summarize_script= os.path.join(tool_dir,"summarize_results.py"), falcon_csv="falcon.csv")
+
+    sumarize_results_end_time = time.time()
+    print(f"sumarize results took {sumarize_results_end_time - cluster_dic_load_time:.2f} s.")
 
     # 3) Merge or Initialize cluster_dic
     falcon_mgf_path = os.path.join(os.getcwd(), "falcon.mgf")
@@ -450,6 +509,10 @@ def cluster_one_folder(folder, checkpoint_dir,output_dir,tool_dir):
         print("[cluster_one_folder] Performing initial clustering...")
         cluster_dic = initial_cluster_dic(cluster_info_tsv, falcon_mgf_path, folder_spec_dic)
 
+    update_cluster_end_time = time.time()
+    print(f"Merge results took {update_cluster_end_time - sumarize_results_end_time:.2f} s.")
+
+
     # Clean up local falcon outputs
     if os.path.exists("falcon.csv"):
         os.remove("falcon.csv")
@@ -460,17 +523,27 @@ def cluster_one_folder(folder, checkpoint_dir,output_dir,tool_dir):
 
     # 4) Write updated consensus
     n_written = write_mzml(cluster_dic, output_consensus_path)
-    print(f"[cluster_one_folder] Wrote {n_written} spectra to consensus: {consensus_path}")
+    print(f"[cluster_one_folder] Wrote {n_written} spectra to consensus: {output_consensus_path}")
+
+    consensus_write_end_time = time.time()
+    print(f"consensus mzML writing took {consensus_write_end_time - update_cluster_end_time:.2f} s.")
+
 
     # 5) Save updated cluster_dic
     save_cluster_dic_hdf5_optimized(cluster_dic, output_cluster_dic_path)
-    print(f"[cluster_one_folder] Updated cluster_dic saved at {cluster_dic_path}")
+    print(f"[cluster_one_folder] Updated cluster_dic saved at {output_cluster_dic_path}")
+
+    save_cluster_dic_end_time = time.time()
+    print(f"Save cluster dic took {save_cluster_dic_end_time - consensus_write_end_time:.2f} s.")
+
 
     finalize_results(cluster_dic, output_dir)
+    output_results_end_time = time.time()
+    print(f"Output results took {output_results_end_time - save_cluster_dic_end_time:.2f} s.")
 
     # optional memory cleanup
-    del cluster_dic, folder_spec_dic
-    gc.collect()
+    # del cluster_dic, folder_spec_dic
+    # gc.collect()
 
 def finalize_results(cluster_dic, output_dir):
 
@@ -509,10 +582,35 @@ def main():
                         help="Where a final cluster_info.tsv might be placed (after all runs).")
     parser.add_argument("--tool_dir", default="./bin",
                         help="Where tool scripts might be placed.")
+
+    # Falcon parameters
+    parser.add_argument("--precursor_tol", default="20 ppm",
+                       help="Precursor tolerance (e.g., '20 ppm' or '0.5 Da')")
+    parser.add_argument("--fragment_tol", type=float, default=0.05,
+                       help="Fragment tolerance in Da")
+    parser.add_argument("--min_mz_range", type=float, default=0,
+                       help="Minimum m/z range for clustering")
+    parser.add_argument("--min_mz", type=float, default=0,
+                       help="Minimum m/z value to consider")
+    parser.add_argument("--max_mz", type=float, default=30000,
+                       help="Maximum m/z value to consider")
+    parser.add_argument("--eps", type=float, default=0.1,
+                       help="EPS parameter for DBSCAN clustering")
     args = parser.parse_args()
 
     # 1) Process exactly one folder
-    cluster_one_folder(args.folder, args.checkpoint_dir, args.output_dir,args.tool_dir)
+    cluster_one_folder(
+        args.folder,
+        args.checkpoint_dir,
+        args.output_dir,
+        args.tool_dir,
+        args.precursor_tol,
+        args.fragment_tol,
+        args.min_mz_range,
+        args.min_mz,
+        args.max_mz,
+        args.eps
+    )
 
 
 if __name__ == "__main__":
