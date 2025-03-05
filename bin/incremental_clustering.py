@@ -19,6 +19,11 @@ import datetime
 import h5py
 import numpy as np
 from csv import DictWriter
+import pyarrow.parquet as pq
+from numcodecs import VLenArray, Blosc  # Add these imports at the top
+import zarr
+import numcodecs
+import pyarrow as pa
 import gc
 
 ##############################################################################
@@ -428,6 +433,149 @@ def update_cluster_dic(cluster_dic, cluster_info_tsv, falcon_mgf, spectra_dic):
 
     return cluster_dic
 
+
+def save_cluster_dic_optimized(cluster_dic, out_dir):
+    # Create output directory
+    os.makedirs(out_dir, exist_ok=True)
+
+    # 1. Save scan_list as Parquet
+    scan_rows = []
+    for cid, cdata in cluster_dic.items():
+        for (fn, sc, pmz, rt) in cdata["scan_list"]:
+            scan_rows.append({
+                "cluster_id": cid,
+                "filename": fn,
+                "scan": sc,
+                "precursor_mz": pmz,
+                "retention_time": rt
+            })
+    scan_df = pd.DataFrame(scan_rows)
+    pq.write_table(pa.Table.from_pandas(scan_df), os.path.join(out_dir, "scan_list.parquet"))
+
+    # 2. Save spec_pool and spectrum as Zarr with variable-length arrays
+    store = zarr.DirectoryStore(os.path.join(out_dir, "spec_data.zarr"))
+    root = zarr.group(store=store, overwrite=True)
+
+    for cid in tqdm(cluster_dic, desc="Saving spec data"):
+        cgroup = root.create_group(str(cid))
+        cdata = cluster_dic[cid]
+
+        # Save spec_pool with VLenArray codec
+        if cdata["spec_pool"]:
+            # Convert to numpy object arrays
+            mz_arrays = [
+                np.array(s["m/z array"], dtype=np.float32)
+                for s in cdata["spec_pool"]
+            ]
+            int_arrays = [
+                np.array(s["intensity array"], dtype=np.float32)
+                for s in cdata["spec_pool"]
+            ]
+
+            # Create object arrays for variable-length storage
+            mz_obj = np.empty(len(mz_arrays), dtype=object)
+            mz_obj[:] = mz_arrays
+            int_obj = np.empty(len(int_arrays), dtype=object)
+            int_obj[:] = int_arrays
+
+            # Store with VLenArray codec
+            cgroup.create_dataset(
+                "spec_pool/mz",
+                data=mz_obj,
+                chunks=(500,),
+                compressor=Blosc(),
+                object_codec=VLenArray(np.float32)
+            )
+            cgroup.create_dataset(
+                "spec_pool/intensity",
+                data=int_obj,
+                chunks=(500,),
+                compressor=Blosc(),
+                object_codec=VLenArray(np.float32)
+            )
+
+        # Save spectrum
+        if "spectrum" in cdata:
+            spec = cdata["spectrum"]
+            spec_grp = cgroup.create_group("spectrum")
+            spec_grp.array("mz", np.array(spec["m/z array"], dtype=np.float32),
+                           compressor=Blosc())
+            spec_grp.array("intensity", np.array(spec["intensity array"], dtype=np.float32),
+                           compressor=Blosc())
+            for key in ["precursor_mz", "rtinseconds", "charge"]:
+                if key in spec:
+                    spec_grp.attrs[key] = spec[key]
+
+
+def load_cluster_dic_optimized(in_dir):
+    cluster_dic = {}
+
+    if not os.path.exists(in_dir):
+        return cluster_dic
+
+    # Check required files exist
+    required_files = [
+        os.path.join(in_dir, "scan_list.parquet"),
+        os.path.join(in_dir, "spec_data.zarr")
+    ]
+    if not all(os.path.exists(f) for f in required_files):
+        return cluster_dic
+
+    # 1. Load scan_list from Parquet
+    try:
+        scan_df = pq.read_table(os.path.join(in_dir, "scan_list.parquet")).to_pandas()
+        for _, row in scan_df.iterrows():
+            cid = row["cluster_id"]
+            if cid not in cluster_dic:
+                cluster_dic[cid] = {"scan_list": [], "spec_pool": []}
+            cluster_dic[cid]["scan_list"].append((
+                row["filename"], row["scan"], row["precursor_mz"], row["retention_time"]
+            ))
+    except Exception as e:
+        print(f"Error loading scan_list: {e}")
+        return cluster_dic
+
+    # 2. Load spectral data from Zarr
+    try:
+        root = zarr.open(os.path.join(in_dir, "spec_data.zarr"), mode='r')
+        for cid in tqdm(root, desc="Loading spec data"):
+            cid_int = int(cid)
+            cgroup = root[cid]
+
+            # Initialize cluster if not exists
+            if cid_int not in cluster_dic:
+                cluster_dic[cid_int] = {"scan_list": [], "spec_pool": []}
+
+            # Load spec_pool
+            if "spec_pool/mz" in cgroup:
+                mz_data = cgroup["spec_pool/mz"][:]
+                int_data = cgroup["spec_pool/intensity"][:]
+                cluster_dic[cid_int]["spec_pool"] = [
+                    {
+                        "m/z array": mz.tolist(),
+                        "intensity array": inten.tolist()
+                    }
+                    for mz, inten in zip(mz_data, int_data)
+                ]
+
+            # Load spectrum
+            if "spectrum" in cgroup:
+                spec_grp = cgroup["spectrum"]
+                spectrum = {
+                    "m/z array": spec_grp["mz"][:].tolist(),
+                    "intensity array": spec_grp["intensity"][:].tolist()
+                }
+                for key in ["precursor_mz", "rtinseconds", "charge"]:
+                    if key in spec_grp.attrs:
+                        spectrum[key] = spec_grp.attrs[key]
+                cluster_dic[cid_int]["spectrum"] = spectrum
+
+    except Exception as e:
+        print(f"Error loading spec_data: {e}")
+        return cluster_dic
+
+    return cluster_dic
+
 ##############################################################################
 # 4) DRIVER LOGIC: ONE FOLDER AT A TIME
 ##############################################################################
@@ -446,6 +594,9 @@ def cluster_one_folder(folder, checkpoint_dir, output_dir, tool_dir, precursor_t
     output_cluster_dic_path = os.path.join(output_dir, "cluster_dic.h5")
     output_consensus_path = os.path.join(output_dir, "consensus.mzML")
 
+    scan_parquet = os.path.join(checkpoint_dir, "scan_list.parquet")
+    spec_zarr = os.path.join(checkpoint_dir, "spec_data.zarr")
+
 
 
     if os.path.exists(consensus_path):
@@ -455,6 +606,11 @@ def cluster_one_folder(folder, checkpoint_dir, output_dir, tool_dir, precursor_t
     else:
         input_files = f"{folder}/*.mzML"
         print(f"[cluster_one_folder] No consensus file found; proceeding with folder mzML files only.")
+
+    current_batch_files = set()
+    for fname in os.listdir(folder):
+        if fname.endswith('.mzML') and fname != 'consensus.mzML':
+            current_batch_files.add(fname)  # Store base name, not full path
 
     start_time = time.time()
 
@@ -484,8 +640,12 @@ def cluster_one_folder(folder, checkpoint_dir, output_dir, tool_dir, precursor_t
 
     # Read existing cluster_dic (if any)
 
-    cluster_dic = load_cluster_dic_hdf5_optimized(cluster_dic_path)
-    has_checkpoint = (len(cluster_dic) > 0)
+    has_checkpoint = os.path.exists(scan_parquet) and os.path.exists(spec_zarr)
+
+    if has_checkpoint:
+        cluster_dic = load_cluster_dic_optimized(checkpoint_dir)
+    else:
+        cluster_dic = {}  # Start fresh
 
     cluster_dic_load_time = time.time()
 
@@ -530,14 +690,14 @@ def cluster_one_folder(folder, checkpoint_dir, output_dir, tool_dir, precursor_t
 
 
     # 5) Save updated cluster_dic
-    save_cluster_dic_hdf5_optimized(cluster_dic, output_cluster_dic_path)
-    print(f"[cluster_one_folder] Updated cluster_dic saved at {output_cluster_dic_path}")
+    save_cluster_dic_optimized(cluster_dic, output_dir)
+    print(f"[cluster_one_folder] Updated cluster_dic saved at {output_dir}")
 
     save_cluster_dic_end_time = time.time()
     print(f"Save cluster dic took {save_cluster_dic_end_time - consensus_write_end_time:.2f} s.")
 
 
-    finalize_results(cluster_dic, output_dir)
+    finalize_results(cluster_dic, output_dir, current_batch_files)
     output_results_end_time = time.time()
     print(f"Output results took {output_results_end_time - save_cluster_dic_end_time:.2f} s.")
 
@@ -545,25 +705,25 @@ def cluster_one_folder(folder, checkpoint_dir, output_dir, tool_dir, precursor_t
     # del cluster_dic, folder_spec_dic
     # gc.collect()
 
-def finalize_results(cluster_dic, output_dir):
-
-
+def finalize_results(cluster_dic, output_dir, current_batch_files=None):
     out_tsv = os.path.join(output_dir, "cluster_info.tsv")
     os.makedirs(output_dir, exist_ok=True)
 
-    fieldnames = ['precursor_mz','retention_time','cluster','filename','scan']
+    fieldnames = ['precursor_mz','retention_time','cluster','filename','scan', 'new_batch']
     with open(out_tsv, 'w', newline='') as f:
         w = DictWriter(f, fieldnames=fieldnames, delimiter='\t')
         w.writeheader()
         for cid, cdata in cluster_dic.items():
             for item in cdata['scan_list']:
                 fn, sc, pmz, rt = item
+                is_new = 'yes' if current_batch_files and os.path.basename(fn) in current_batch_files else 'no'
                 row = {
                     'precursor_mz': pmz,
                     'retention_time': rt,
                     'cluster': cid,
                     'filename': fn,
-                    'scan': sc
+                    'scan': sc,
+                    'new_batch': is_new
                 }
                 w.writerow(row)
 

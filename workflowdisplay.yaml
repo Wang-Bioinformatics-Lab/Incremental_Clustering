@@ -18,6 +18,8 @@ Views:
                 data: filename
             -   title: "scan"
                 data: scan
+            -   title: 'new_batch'
+                data: new_batch
 
 -   name: section
     displayname: Downstream Analysis
