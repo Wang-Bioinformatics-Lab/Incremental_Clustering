@@ -20,10 +20,14 @@ import h5py
 import numpy as np
 from csv import DictWriter
 import pyarrow.parquet as pq
+import pyarrow.feather as feather
 from numcodecs import VLenArray, Blosc  # Add these imports at the top
 import zarr
 import numcodecs
 import pyarrow as pa
+from zarr.storage import ZipStore
+import concurrent.futures
+from functools import partial
 import gc
 
 ##############################################################################
@@ -434,145 +438,140 @@ def update_cluster_dic(cluster_dic, cluster_info_tsv, falcon_mgf, spectra_dic):
     return cluster_dic
 
 
-def save_cluster_dic_optimized(cluster_dic, out_dir):
+def save_cluster_dic_optimized(cluster_dic, out_dir, max_workers=8):
     # Create output directory
     os.makedirs(out_dir, exist_ok=True)
 
-    # 1. Save scan_list as Parquet
-    scan_rows = []
-    for cid, cdata in cluster_dic.items():
-        for (fn, sc, pmz, rt) in cdata["scan_list"]:
-            scan_rows.append({
-                "cluster_id": cid,
-                "filename": fn,
-                "scan": sc,
-                "precursor_mz": pmz,
-                "retention_time": rt
-            })
-    scan_df = pd.DataFrame(scan_rows)
-    pq.write_table(pa.Table.from_pandas(scan_df), os.path.join(out_dir, "scan_list.parquet"))
+    # 1. Save scan_list with multithreaded DataFrame creation
+    def process_scan_chunk(clusters_chunk):
+        return [
+            (cid, fn, sc, pmz, rt)
+            for cid, cdata in clusters_chunk
+            for (fn, sc, pmz, rt) in cdata["scan_list"]
+        ]
 
-    # 2. Save spec_pool and spectrum as Zarr with variable-length arrays
-    store = zarr.DirectoryStore(os.path.join(out_dir, "spec_data.zarr"))
-    root = zarr.group(store=store, overwrite=True)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        # Process scan_list in parallel
+        chunks = np.array_split(list(cluster_dic.items()), max_workers)
+        futures = [executor.submit(process_scan_chunk, chunk) for chunk in chunks]
+        scan_rows = []
+        for future in concurrent.futures.as_completed(futures):
+            scan_rows.extend(future.result())
 
-    for cid in tqdm(cluster_dic, desc="Saving spec data"):
-        cgroup = root.create_group(str(cid))
+        # Create and save scan_df
+        scan_df = pd.DataFrame(scan_rows,
+                               columns=["cluster_id", "filename", "scan", "precursor_mz", "retention_time"])
+        executor.submit(
+            partial(feather.write_feather, scan_df,
+                    os.path.join(out_dir, "scan_list.feather"))
+        )
+
+    # 2. Save spec_data with parallel Arrow table construction
+    def process_spec_chunk(cid):
         cdata = cluster_dic[cid]
+        spec_pool = cdata.get("spec_pool", [])
+        spectrum = cdata.get("spectrum", {})
 
-        # Save spec_pool with VLenArray codec
-        if cdata["spec_pool"]:
-            # Convert to numpy object arrays
-            mz_arrays = [
-                np.array(s["m/z array"], dtype=np.float32)
-                for s in cdata["spec_pool"]
-            ]
-            int_arrays = [
-                np.array(s["intensity array"], dtype=np.float32)
-                for s in cdata["spec_pool"]
-            ]
+        return {
+            "cluster_id": cid,
+            "spec_pool_mz": [s["m/z array"] for s in spec_pool],
+            "spec_pool_intensity": [s["intensity array"] for s in spec_pool],
+            "spectrum_mz": spectrum.get("m/z array", []),
+            "spectrum_intensity": spectrum.get("intensity array", []),
+            "precursor_mz": spectrum.get("precursor_mz"),
+            "rtinseconds": spectrum.get("rtinseconds"),
+            "charge": spectrum.get("charge"),
+            "title": spectrum.get("title", "")
+        }
 
-            # Create object arrays for variable-length storage
-            mz_obj = np.empty(len(mz_arrays), dtype=object)
-            mz_obj[:] = mz_arrays
-            int_obj = np.empty(len(int_arrays), dtype=object)
-            int_obj[:] = int_arrays
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        # Process all clusters in parallel
+        spec_rows = list(executor.map(process_spec_chunk, cluster_dic.keys()))
 
-            # Store with VLenArray codec
-            cgroup.create_dataset(
-                "spec_pool/mz",
-                data=mz_obj,
-                chunks=(500,),
-                compressor=Blosc(),
-                object_codec=VLenArray(np.float32)
-            )
-            cgroup.create_dataset(
-                "spec_pool/intensity",
-                data=int_obj,
-                chunks=(500,),
-                compressor=Blosc(),
-                object_codec=VLenArray(np.float32)
-            )
+        # Convert to Arrow Table with multithreaded conversion
+        spec_table = pa.Table.from_pandas(pd.DataFrame(spec_rows))
 
-        # Save spectrum
-        if "spectrum" in cdata:
-            spec = cdata["spectrum"]
-            spec_grp = cgroup.create_group("spectrum")
-            spec_grp.array("mz", np.array(spec["m/z array"], dtype=np.float32),
-                           compressor=Blosc())
-            spec_grp.array("intensity", np.array(spec["intensity array"], dtype=np.float32),
-                           compressor=Blosc())
-            for key in ["precursor_mz", "rtinseconds", "charge"]:
-                if key in spec:
-                    spec_grp.attrs[key] = spec[key]
+        # Save with Parquet's native multithreading
+        pq.write_table(
+            spec_table,
+            os.path.join(out_dir, "spec_data.parquet"),
+            compression='ZSTD',
+            use_dictionary=True,
+            write_statistics=True,
+            flavor='spark',
+            use_threads=True
+        )
 
 
-def load_cluster_dic_optimized(in_dir):
+def load_cluster_dic_optimized(in_dir, max_workers=8):
+    """
+    Multithreaded load with parallel Parquet decoding
+    """
     cluster_dic = {}
-
     if not os.path.exists(in_dir):
         return cluster_dic
 
-    # Check required files exist
-    required_files = [
-        os.path.join(in_dir, "scan_list.parquet"),
-        os.path.join(in_dir, "spec_data.zarr")
-    ]
-    if not all(os.path.exists(f) for f in required_files):
-        return cluster_dic
+    # 1. Load scan_list with fast single-threaded Feather read
+    scan_df = feather.read_feather(os.path.join(in_dir, "scan_list.feather"))
 
-    # 1. Load scan_list from Parquet
-    try:
-        scan_df = pq.read_table(os.path.join(in_dir, "scan_list.parquet")).to_pandas()
-        for _, row in scan_df.iterrows():
+    # 2. Parallel scan_list processing
+    def process_scan_chunk(chunk):
+        local_dict = {}
+        for _, row in chunk.iterrows():
             cid = row["cluster_id"]
-            if cid not in cluster_dic:
-                cluster_dic[cid] = {"scan_list": [], "spec_pool": []}
-            cluster_dic[cid]["scan_list"].append((
-                row["filename"], row["scan"], row["precursor_mz"], row["retention_time"]
+            if cid not in local_dict:
+                local_dict[cid] = {"scan_list": []}
+            local_dict[cid]["scan_list"].append((
+                row["filename"], row["scan"],
+                row["precursor_mz"], row["retention_time"]
             ))
-    except Exception as e:
-        print(f"Error loading scan_list: {e}")
-        return cluster_dic
+        return local_dict
 
-    # 2. Load spectral data from Zarr
-    try:
-        root = zarr.open(os.path.join(in_dir, "spec_data.zarr"), mode='r')
-        for cid in tqdm(root, desc="Loading spec data"):
-            cid_int = int(cid)
-            cgroup = root[cid]
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        chunks = np.array_split(scan_df, max_workers)
+        futures = [executor.submit(process_scan_chunk, chunk) for chunk in chunks]
+        for future in concurrent.futures.as_completed(futures):
+            for cid, data in future.result().items():
+                if cid not in cluster_dic:
+                    cluster_dic[cid] = {"scan_list": []}
+                cluster_dic[cid]["scan_list"].extend(data["scan_list"])
 
-            # Initialize cluster if not exists
-            if cid_int not in cluster_dic:
-                cluster_dic[cid_int] = {"scan_list": [], "spec_pool": []}
+    # 3. Multithreaded Parquet loading
+    spec_table = pq.read_table(
+        os.path.join(in_dir, "spec_data.parquet"),
+        use_threads=True,
+        memory_map=True
+    )
+    spec_df = spec_table.to_pandas()
 
-            # Load spec_pool
-            if "spec_pool/mz" in cgroup:
-                mz_data = cgroup["spec_pool/mz"][:]
-                int_data = cgroup["spec_pool/intensity"][:]
-                cluster_dic[cid_int]["spec_pool"] = [
-                    {
-                        "m/z array": mz.tolist(),
-                        "intensity array": inten.tolist()
-                    }
-                    for mz, inten in zip(mz_data, int_data)
-                ]
-
-            # Load spectrum
-            if "spectrum" in cgroup:
-                spec_grp = cgroup["spectrum"]
-                spectrum = {
-                    "m/z array": spec_grp["mz"][:].tolist(),
-                    "intensity array": spec_grp["intensity"][:].tolist()
+    # 4. Parallel spec_data processing
+    def process_spec_row(row):
+        return (
+            row["cluster_id"],
+            {
+                "spec_pool": [
+                    {"m/z array": mz, "intensity array": inten}
+                    for mz, inten in zip(row["spec_pool_mz"], row["spec_pool_intensity"])
+                ],
+                "spectrum": {
+                    "m/z array": row["spectrum_mz"],
+                    "intensity array": row["spectrum_intensity"],
+                    "precursor_mz": row["precursor_mz"],
+                    "rtinseconds": row["rtinseconds"],
+                    "charge": row["charge"],
+                    "title": row["title"]
                 }
-                for key in ["precursor_mz", "rtinseconds", "charge"]:
-                    if key in spec_grp.attrs:
-                        spectrum[key] = spec_grp.attrs[key]
-                cluster_dic[cid_int]["spectrum"] = spectrum
+            }
+        )
 
-    except Exception as e:
-        print(f"Error loading spec_data: {e}")
-        return cluster_dic
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [executor.submit(process_spec_row, row) for _, row in spec_df.iterrows()]
+        for future in concurrent.futures.as_completed(futures):
+            cid, data = future.result()
+            if cid in cluster_dic:
+                cluster_dic[cid].update(data)
+            else:
+                cluster_dic[cid] = data
 
     return cluster_dic
 
@@ -594,8 +593,8 @@ def cluster_one_folder(folder, checkpoint_dir, output_dir, tool_dir, precursor_t
     output_cluster_dic_path = os.path.join(output_dir, "cluster_dic.h5")
     output_consensus_path = os.path.join(output_dir, "consensus.mzML")
 
-    scan_parquet = os.path.join(checkpoint_dir, "scan_list.parquet")
-    spec_zarr = os.path.join(checkpoint_dir, "spec_data.zarr")
+    scan_feather = os.path.join(checkpoint_dir, "scan_list.feather")
+    spec_parquet = os.path.join(checkpoint_dir, "spec_data.parquet")
 
 
 
@@ -640,7 +639,7 @@ def cluster_one_folder(folder, checkpoint_dir, output_dir, tool_dir, precursor_t
 
     # Read existing cluster_dic (if any)
 
-    has_checkpoint = os.path.exists(scan_parquet) and os.path.exists(spec_zarr)
+    has_checkpoint = os.path.exists(scan_feather) and os.path.exists(spec_parquet)
 
     if has_checkpoint:
         cluster_dic = load_cluster_dic_optimized(checkpoint_dir)
