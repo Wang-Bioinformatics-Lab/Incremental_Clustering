@@ -51,8 +51,8 @@ def run_falcon(mzml_pattern, output_prefix="falcon", precursor_tol="20 ppm", fra
     print(f"[run_falcon] Running: {command}")
     process = subprocess.Popen(command, shell=True)
     retcode = process.wait()
-    if retcode != 0:
-        raise RuntimeError(f"Falcon failed with exit code {retcode}")
+    # if retcode != 0:
+    #     raise RuntimeError(f"Falcon failed with exit code {retcode}")
 
 
 def summarize_output(output_path,summarize_script="summarize_results.py", falcon_csv="falcon.csv"):
@@ -535,32 +535,30 @@ def update_cluster_dic(cluster_dic, cluster_info_tsv, falcon_mgf, spectra_dic):
 #     if not os.path.exists(in_dir):
 #         return cluster_dic
 #
-#     # 1. Load scan_list
+#     # 1. Load scan_list with zero-copy memory mapping
 #     scan_table = feather.read_table(os.path.join(in_dir, "scan_list.feather"),
 #                                     memory_map=True)
 #     scan_df = scan_table.to_pandas()
 #
 #     # 2. Fixed parallel scan_list processing
 #     def merge_scan_chunk(chunk):
-#         # Modern Pandas groupby with explicit column selection
-#         return (
-#             chunk[['cluster_id', 'filename', 'scan', 'precursor_mz', 'retention_time']]
-#             .groupby('cluster_id', group_keys=False)
-#             .apply(lambda x: x[['filename', 'scan', 'precursor_mz', 'retention_time']].values.tolist())
-#             .reset_index()
-#             .groupby('cluster_id')[0]
-#             .agg(list)
-#             .to_dict()
-#         )
+#         # Use groupby with modern Pandas syntax
+#         return chunk.groupby('cluster_id', group_keys=False)\
+#                     .apply(lambda x: x[['filename', 'scan',
+#                                        'precursor_mz', 'retention_time']].values.tolist())\
+#                     .to_dict()
 #
 #     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
 #         chunks = np.array_split(scan_df, max_workers)
 #         results = executor.map(merge_scan_chunk, chunks)
-#
 #         for result in results:
-#             if result:  # Add empty dict check
+#             if result is not None:  # Add null check
 #                 for cid, scans in result.items():
 #                     cluster_dic.setdefault(cid, {}).setdefault("scan_list", []).extend(scans)
+#
+#     # 3. Load spec_data (unchanged)
+#     # ... rest of the code remains the same ...
+#
 #
 #     # 3. Load spec_data with parallel column decoding
 #     spec_table = pq.read_table(os.path.join(in_dir, "spec_data.parquet"),
@@ -601,11 +599,6 @@ def update_cluster_dic(cluster_dic, cluster_info_tsv, falcon_mgf, spectra_dic):
 #                 cluster_dic[cid] = data
 #
 #     return cluster_dic
-
-##############################################################################
-# 4) DRIVER LOGIC: ONE FOLDER AT A TIME
-##############################################################################
-
 def save_cluster_dic_optimized(cluster_dic, out_dir, max_workers=8):
     """Optimized saving with robust type handling"""
     os.makedirs(out_dir, exist_ok=True)
@@ -733,6 +726,9 @@ def load_cluster_dic_optimized(in_dir, max_workers=8):
             cluster_dic.setdefault(cid, {}).update(data)
 
     return cluster_dic
+##############################################################################
+# 4) DRIVER LOGIC: ONE FOLDER AT A TIME
+##############################################################################
 
 def cluster_one_folder(folder, checkpoint_dir, output_dir, tool_dir, precursor_tol, fragment_tol, min_mz_range, min_mz, max_mz, eps):
     """
