@@ -31,7 +31,8 @@ process CLUSTERING {
     file "results/*mzML" optional true
     file "results/*tsv" optional true
     file "results/*csv" optional true
-    file "results/*h5" optional true
+    file "results/*feather" optional true
+    file "results/*parquet" optional true
 
     script:
     """

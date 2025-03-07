@@ -22,10 +22,8 @@ from csv import DictWriter
 import pyarrow.parquet as pq
 import pyarrow.feather as feather
 from numcodecs import VLenArray, Blosc  # Add these imports at the top
-import zarr
 import numcodecs
 import pyarrow as pa
-from zarr.storage import ZipStore
 import concurrent.futures
 from functools import partial
 import gc
@@ -67,6 +65,69 @@ def summarize_output(output_path,summarize_script="summarize_results.py", falcon
     proc = subprocess.Popen(command, shell=True)
     proc.wait()
     return os.path.join(output_dir, "cluster_info.tsv")
+
+
+class MzMLIndexer:
+    """Lazy loader for mzML files with scan-level indexing"""
+
+    def __init__(self, folder_path):
+        self.folder = folder_path
+        self._index = {}  # (filename_base, scan_id) -> file_path
+        self._file_handles = {}
+        self._build_index()
+
+    def _build_index(self):
+        """Create scan ID to file path mapping without loading spectra"""
+        for fname in os.listdir(self.folder):
+            if fname.endswith(".mzML") and fname != "consensus.mzML":
+                file_path = os.path.join(self.folder, fname)
+                base = os.path.splitext(fname)[0]
+                with pymzml.run.Reader(file_path) as reader:
+                    for spectrum in reader:
+                        if spectrum['ms level'] == 2:
+                            scan_id = spectrum['id']
+                            self._index[(base, scan_id)] = file_path
+
+    @lru_cache(maxsize=100000)
+    def get_spectrum(self, base, scan_id):
+        """Get spectrum data on demand with caching"""
+        file_path = self._index.get((base, scan_id))
+        if not file_path:
+            return None
+
+        if file_path not in self._file_handles:
+            self._file_handles[file_path] = pymzml.run.Reader(file_path)
+
+        reader = self._file_handles[file_path]
+        for spectrum in reader:
+            if spectrum['id'] == scan_id and spectrum['ms level'] == 2:
+                return self._create_spectrum_dict(spectrum)
+        return None
+
+    def _create_spectrum_dict(self, spectrum):
+        """Create spectrum dict from pymzml spectrum object"""
+        return {
+            'peaks': [(mz, intensity) for mz, intensity in spectrum.peaks],
+            'm/z array': spectrum.mz,
+            'intensity array': spectrum.i,
+            'precursor_mz': spectrum.selected_precursors[0]['mz'],
+            'rtinseconds': spectrum.scan_time[0],
+            'scans': spectrum['id'],
+            'charge': spectrum.selected_precursors[0].get('charge', None)
+        }
+
+    def close(self):
+        """Clean up open file handles"""
+        for reader in self._file_handles.values():
+            reader.close()
+        self._file_handles.clear()
+
+
+# Modified read_mzml_parallel replacement
+def create_mzml_indexer(folder_path):
+    """Create a lazy-loading indexer instead of loading all spectra"""
+    return MzMLIndexer(folder_path)
+
 
 def read_mzml(filepath):
     """

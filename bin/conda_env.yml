@@ -18,3 +18,5 @@ dependencies:
     - spectrum-utils==0.3.5
     - falcon-ms
     - pymzml
+    - numcodecs
+    - pyarrow
