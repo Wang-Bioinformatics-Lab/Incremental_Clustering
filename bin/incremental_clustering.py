@@ -51,8 +51,8 @@ def run_falcon(mzml_pattern, output_prefix="falcon", precursor_tol="20 ppm", fra
     print(f"[run_falcon] Running: {command}")
     process = subprocess.Popen(command, shell=True)
     retcode = process.wait()
-    # if retcode != 0:
-    #     raise RuntimeError(f"Falcon failed with exit code {retcode}")
+    if retcode != 0:
+        raise RuntimeError(f"Falcon failed with exit code {retcode}")
 
 
 def summarize_output(output_path,summarize_script="summarize_results.py", falcon_csv="falcon.csv"):
@@ -139,13 +139,14 @@ def write_mzml(cluster_dic, out_path):
                 _add_spectrum(exp, sp_data, cid)
                 write_count += 1
             else:
-                # sample 9 from spec_pool + the 'spectrum'
-                chosen = random.sample(data['spec_pool'], 9)
+                # sample 10 from spec_pool + the 'spectrum'
+                chosen = random.sample(data['spec_pool'], 10)
                 chosen.append(data['spectrum'])
                 for i, sp_data in enumerate(chosen, start=1):
                     new_id = f"{cid}_{i}"
                     _add_spectrum(exp, sp_data, new_id)
-                write_count += 10
+                write_count += 11
+                data['spec_pool'] = chosen
         except Exception as err:
             print(f"Error in write_mzml for cluster {cid}: {err}")
     f = oms.MzMLFile()
@@ -437,168 +438,6 @@ def update_cluster_dic(cluster_dic, cluster_info_tsv, falcon_mgf, spectra_dic):
 
     return cluster_dic
 
-
-# def save_cluster_dic_optimized(cluster_dic, out_dir, max_workers=8):
-#     """Optimized saving with type enforcement and parallel processing"""
-#     os.makedirs(out_dir, exist_ok=True)
-#
-#     # 1. Save scan_list with strict type enforcement
-#     scan_schema = pa.schema([
-#         ("cluster_id", pa.int32()),
-#         ("filename", pa.string()),
-#         ("scan", pa.int32()),
-#         ("precursor_mz", pa.float32()),
-#         ("retention_time", pa.float32())
-#     ])
-#
-#     def create_scan_chunk(chunk):
-#
-#         return pa.RecordBatch.from_pylist([
-#             {
-#                 "cluster_id": int(cid),
-#                 "filename": str(fn),
-#                 "scan": int(sc),
-#                 "precursor_mz": float(pmz),
-#                 "retention_time": float(rt)
-#             }
-#             for cid, cdata in chunk
-#             for (fn, sc, pmz, rt) in cdata["scan_list"]
-#         ], schema=scan_schema)
-#
-#     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-#         # Process in parallel batches
-#         chunks = np.array_split(list(cluster_dic.items()), max_workers)
-#         record_batches = executor.map(create_scan_chunk, chunks)
-#
-#         # Write directly to Feather with multithreading
-#         with pa.OSFile(os.path.join(out_dir, "scan_list.feather"), "wb") as sink:
-#             with pa.ipc.new_file(sink, scan_schema) as writer:
-#                 for rb in record_batches:
-#                     writer.write(rb)
-#
-#     # 2. Save spec_data with optimized type handling
-#     spec_schema = pa.schema([
-#         ("cluster_id", pa.int32()),
-#         ("spec_pool_mz", pa.list_(pa.list_(pa.float32()))),
-#         ("spec_pool_intensity", pa.list_(pa.list_(pa.float32()))),
-#         ("spectrum_mz", pa.list_(pa.float32())),
-#         ("spectrum_intensity", pa.list_(pa.float32())),
-#         ("precursor_mz", pa.float32()),
-#         ("rtinseconds", pa.float32()),
-#         ("charge", pa.int32()),
-#         ("title", pa.string())
-#     ])
-#
-#     def create_spec_chunk(cid):
-#         cdata = cluster_dic[cid]
-#         spec = cdata.get("spectrum", {})
-#
-#         # Handle charge conversion with proper empty value handling
-#         raw_charge = str(spec.get("charge", "0")).strip()
-#         digits = ''.join(filter(str.isdigit, raw_charge))
-#         charge = int(digits) if digits else 0  # Explicit empty handling
-#         return {
-#             "cluster_id": int(cid),
-#             "spec_pool_mz": [np.array(s["m/z array"], dtype=np.float32).tolist()
-#                              for s in cdata.get("spec_pool", [])],
-#             "spec_pool_intensity": [np.array(s["intensity array"], dtype=np.float32).tolist()
-#                                     for s in cdata.get("spec_pool", [])],
-#             "spectrum_mz": np.array(spec.get("m/z array", []), dtype=np.float32).tolist(),
-#             "spectrum_intensity": np.array(spec.get("intensity array", []), dtype=np.float32).tolist(),
-#             "precursor_mz": float(spec.get("precursor_mz", 0.0)),
-#             "rtinseconds": float(spec.get("rtinseconds", 0.0)),
-#             "charge": charge,  # Use sanitized charge value
-#             "title": str(spec.get("title", ""))
-#         }
-#
-#     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-#         # Process all clusters in parallel
-#         spec_data = list(executor.map(create_spec_chunk, cluster_dic.keys()))
-#
-#         # Convert directly to Arrow Table
-#         spec_table = pa.Table.from_pylist(spec_data, schema=spec_schema)
-#
-#         # Write with parallel compression
-#         pq.write_table(
-#             spec_table,
-#             os.path.join(out_dir, "spec_data.parquet"),
-#             compression='ZSTD',
-#             use_dictionary=True,
-#             write_statistics=True
-#             # Remove use_threads parameter
-#         )
-#
-#
-# def load_cluster_dic_optimized(in_dir, max_workers=8):
-#     """Optimized loading with parallel decoding"""
-#     cluster_dic = {}
-#     if not os.path.exists(in_dir):
-#         return cluster_dic
-#
-#     # 1. Load scan_list with zero-copy memory mapping
-#     scan_table = feather.read_table(os.path.join(in_dir, "scan_list.feather"),
-#                                     memory_map=True)
-#     scan_df = scan_table.to_pandas()
-#
-#     # 2. Fixed parallel scan_list processing
-#     def merge_scan_chunk(chunk):
-#         # Use groupby with modern Pandas syntax
-#         return chunk.groupby('cluster_id', group_keys=False)\
-#                     .apply(lambda x: x[['filename', 'scan',
-#                                        'precursor_mz', 'retention_time']].values.tolist())\
-#                     .to_dict()
-#
-#     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-#         chunks = np.array_split(scan_df, max_workers)
-#         results = executor.map(merge_scan_chunk, chunks)
-#         for result in results:
-#             if result is not None:  # Add null check
-#                 for cid, scans in result.items():
-#                     cluster_dic.setdefault(cid, {}).setdefault("scan_list", []).extend(scans)
-#
-#     # 3. Load spec_data (unchanged)
-#     # ... rest of the code remains the same ...
-#
-#
-#     # 3. Load spec_data with parallel column decoding
-#     spec_table = pq.read_table(os.path.join(in_dir, "spec_data.parquet"),
-#                                use_threads=True,
-#                                memory_map=True)
-#     spec_df = spec_table.to_pandas()
-#
-#     # 4. Parallel spec_data processing
-#     def process_spec_row(row):
-#         charge = row.charge
-#         if isinstance(charge, int) and charge > 0:
-#             formatted_charge = f"{charge}+"
-#         else:
-#             formatted_charge = str(charge) if charge else "0"
-#
-#         return (row.cluster_id, {
-#             "spec_pool": [
-#                 {"m/z array": mz, "intensity array": inten}
-#                 for mz, inten in zip(row.spec_pool_mz, row.spec_pool_intensity)
-#             ],
-#             "spectrum": {
-#                 "m/z array": row.spectrum_mz,
-#                 "intensity array": row.spectrum_intensity,
-#                 "precursor_mz": row.precursor_mz,
-#                 "rtinseconds": row.rtinseconds,
-#                 "charge": formatted_charge,  # Store as string with '+'
-#                 "title": row.title
-#             }
-#         })
-#
-#     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-#         futures = [executor.submit(process_spec_row, row) for row in spec_df.itertuples()]
-#         for future in concurrent.futures.as_completed(futures):
-#             cid, data = future.result()
-#             if cid in cluster_dic:
-#                 cluster_dic[cid].update(data)
-#             else:
-#                 cluster_dic[cid] = data
-#
-#     return cluster_dic
 def save_cluster_dic_optimized(cluster_dic, out_dir, max_workers=8):
     """Optimized saving with robust type handling"""
     os.makedirs(out_dir, exist_ok=True)
@@ -686,7 +525,7 @@ def load_cluster_dic_optimized(in_dir, max_workers=8):
         return cluster_dic
 
     # 1. Load and process scan_list
-    scan_df = feather.read_feather(os.path.join(in_dir, "scan_list.feather")).to_pandas()
+    scan_df = feather.read_feather(os.path.join(in_dir, "scan_list.feather"))
 
     def process_scan_chunk(chunk):
         return chunk.groupby('cluster_id')[['filename', 'scan', 'precursor_mz', 'retention_time']] \
