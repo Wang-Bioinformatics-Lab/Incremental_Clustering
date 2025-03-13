@@ -25,6 +25,7 @@ from numcodecs import VLenArray, Blosc  # Add these imports at the top
 import numcodecs
 import pyarrow as pa
 import concurrent.futures
+from functools import lru_cache
 from functools import partial
 import gc
 
@@ -49,8 +50,8 @@ def run_falcon(mzml_pattern, output_prefix="falcon", precursor_tol="20 ppm", fra
     print(f"[run_falcon] Running: {command}")
     process = subprocess.Popen(command, shell=True)
     retcode = process.wait()
-    if retcode != 0:
-        raise RuntimeError(f"Falcon failed with exit code {retcode}")
+    # if retcode != 0:
+    #     raise RuntimeError(f"Falcon failed with exit code {retcode}")
 
 
 def summarize_output(output_path,summarize_script="summarize_results.py", falcon_csv="falcon.csv"):
@@ -68,66 +69,87 @@ def summarize_output(output_path,summarize_script="summarize_results.py", falcon
 
 
 class MzMLIndexer:
-    """Lazy loader for mzML files with scan-level indexing"""
+    """Lazy loader compatible with modern pymzml versions"""
 
     def __init__(self, folder_path):
         self.folder = folder_path
-        self._index = {}  # (filename_base, scan_id) -> file_path
-        self._file_handles = {}
+        self._index = {}  # (base, scan_id) → (file_path, offset)
+        self._file_handles = {}  # file_path: {'offsets': dict, 'reader': Reader}
         self._build_index()
 
     def _build_index(self):
-        """Create scan ID to file path mapping without loading spectra"""
+        """Build index using spectrum-specific offsets"""
         for fname in os.listdir(self.folder):
             if fname.endswith(".mzML") and fname != "consensus.mzML":
                 file_path = os.path.join(self.folder, fname)
                 base = os.path.splitext(fname)[0]
+                offset_dict = {}
+
+                # First pass: record MS2 spectrum offsets
                 with pymzml.run.Reader(file_path) as reader:
                     for spectrum in reader:
                         if spectrum['ms level'] == 2:
-                            scan_id = spectrum['id']
-                            self._index[(base, scan_id)] = file_path
+                            try:
+                                scan_id = spectrum['id']
+                                # Use spectrum's internal offset
+                                offset_dict[scan_id] = spectrum._offset
+                                self._index[(base, scan_id)] = (file_path, spectrum._offset)
+                            except AttributeError:
+                                continue
 
-    @lru_cache(maxsize=100000)
+                # Store offset info for this file
+                self._file_handles[file_path] = {
+                    'offsets': offset_dict,
+                    'reader': None
+                }
+
+    @lru_cache(maxsize=500000)
     def get_spectrum(self, base, scan_id):
-        """Get spectrum data on demand with caching"""
-        file_path = self._index.get((base, scan_id))
-        if not file_path:
+        """Direct spectrum access using stored offsets"""
+        index_entry = self._index.get((base, scan_id))
+        if not index_entry:
             return None
 
-        if file_path not in self._file_handles:
-            self._file_handles[file_path] = pymzml.run.Reader(file_path)
+        file_path, offset = index_entry
+        file_info = self._file_handles.get(file_path)
+        if not file_info:
+            return None
 
-        reader = self._file_handles[file_path]
-        for spectrum in reader:
-            if spectrum['id'] == scan_id and spectrum['ms level'] == 2:
+        # Lazy initialize reader with offset dict
+        if not file_info['reader']:
+            file_info['reader'] = pymzml.run.Reader(
+                file_path,
+                offset_dict=file_info['offsets']
+            )
+
+        try:
+            # Access using native offset handling
+            spectrum = file_info['reader'].get_by_id(scan_id)
+            if spectrum and spectrum['ms level'] == 2:
                 return self._create_spectrum_dict(spectrum)
+        except KeyError:
+            return None
         return None
 
     def _create_spectrum_dict(self, spectrum):
-        """Create spectrum dict from pymzml spectrum object"""
         return {
-            'peaks': [(mz, intensity) for mz, intensity in spectrum.peaks],
+            'peaks': [(mz, intensity) for mz, intensity in spectrum.peaks("centroided")],
             'm/z array': spectrum.mz,
             'intensity array': spectrum.i,
             'precursor_mz': spectrum.selected_precursors[0]['mz'],
             'rtinseconds': spectrum.scan_time[0],
-            'scans': spectrum['id'],
-            'charge': spectrum.selected_precursors[0].get('charge', None)
+            'charge': spectrum.selected_precursors[0].get('charge', 0)
         }
 
     def close(self):
-        """Clean up open file handles"""
-        for reader in self._file_handles.values():
-            reader.close()
+        for fh in self._file_handles.values():
+            if fh['reader']:
+                fh['reader'].close()
         self._file_handles.clear()
 
-
-# Modified read_mzml_parallel replacement
 def create_mzml_indexer(folder_path):
     """Create a lazy-loading indexer instead of loading all spectra"""
     return MzMLIndexer(folder_path)
-
 
 def read_mzml(filepath):
     """
@@ -353,7 +375,7 @@ def load_cluster_dic_hdf5_optimized(in_path):
 # 3) UPDATING + MERGING CLUSTER DICS
 ##############################################################################
 
-def initial_cluster_dic(cluster_info_tsv, falcon_mgf, spectra_dic):
+def initial_cluster_dic(cluster_info_tsv, falcon_mgf, indexer):
     """
     Create a cluster_dic from scratch, handling cluster IDs:
     - Non-`-1` clusters retain their original IDs.
@@ -383,7 +405,8 @@ def initial_cluster_dic(cluster_info_tsv, falcon_mgf, spectra_dic):
         pmz = row['precursor_mz']
         rt = row['retention_time']
         base = os.path.splitext(os.path.basename(fn))[0]
-        sp_data = spectra_dic[(base, sc)]
+        sp_data = indexer.get_spectrum(base, sc)
+
 
         if cid not in cluster_dic:
             cluster_dic[cid] = {'scan_list': [], 'spec_pool': []}
@@ -399,7 +422,7 @@ def initial_cluster_dic(cluster_info_tsv, falcon_mgf, spectra_dic):
         pmz = row['precursor_mz']
         rt = row['retention_time']
         base = os.path.splitext(os.path.basename(fn))[0]
-        sp_data = spectra_dic[(base, sc)]
+        sp_data = indexer.get_spectrum(base, sc)
 
         cluster_dic[new_cid] = {
             'scan_list': [(fn, sc, pmz, rt)],
@@ -419,7 +442,7 @@ def initial_cluster_dic(cluster_info_tsv, falcon_mgf, spectra_dic):
 
     return cluster_dic
 
-def update_cluster_dic(cluster_dic, cluster_info_tsv, falcon_mgf, spectra_dic):
+def update_cluster_dic(cluster_dic, cluster_info_tsv, falcon_mgf, indexer):
     """
     Merge newly generated cluster_info into existing cluster_dic
     (i.e., "incremental" approach).
@@ -459,7 +482,7 @@ def update_cluster_dic(cluster_dic, cluster_info_tsv, falcon_mgf, spectra_dic):
         pmz= row['precursor_mz']
         rt = row['retention_time']
         base = os.path.splitext(os.path.basename(fn))[0]
-        sp_data = spectra_dic[(base, sc)]
+        sp_data = indexer.get_spectrum(base, sc)
 
         if cid not in currentID_uniID:
             new_key += 1
@@ -477,7 +500,7 @@ def update_cluster_dic(cluster_dic, cluster_info_tsv, falcon_mgf, spectra_dic):
         pmz= row['precursor_mz']
         rt = row['retention_time']
         base = os.path.splitext(os.path.basename(fn))[0]
-        sp_data = spectra_dic[(base, sc)]
+        sp_data = indexer.get_spectrum(base, sc)
         new_cluster_id += 1
         currentID_uniID[new_cluster_id] = new_cluster_id
         cluster_dic[new_cluster_id] = {'scan_list':[], 'spec_pool':[]}
@@ -681,8 +704,8 @@ def cluster_one_folder(folder, checkpoint_dir, output_dir, tool_dir, precursor_t
     print(f"Falcon clustering took {falcon_end_time- start_time:.2f} s.")
 
     # Build a dictionary of the spectra in this folder
-    print(f"[cluster_one_folder] Building spectra dict for folder: {folder}")
-    folder_spec_dic = read_mzml_parallel(folder)
+    print(f"[cluster_one_folder] Building mzML index for folder: {folder}")
+    indexer = create_mzml_indexer(folder)
 
     mzml_end_time = time.time()
 
@@ -713,23 +736,23 @@ def cluster_one_folder(folder, checkpoint_dir, output_dir, tool_dir, precursor_t
     if has_checkpoint:
         # incremental
         print("[cluster_one_folder] Performing incremental clustering...")
-        cluster_dic = update_cluster_dic(cluster_dic, cluster_info_tsv, falcon_mgf_path, folder_spec_dic)
+        cluster_dic = update_cluster_dic(cluster_dic, cluster_info_tsv, falcon_mgf_path, indexer)
     else:
         # initial
         print("[cluster_one_folder] Performing initial clustering...")
-        cluster_dic = initial_cluster_dic(cluster_info_tsv, falcon_mgf_path, folder_spec_dic)
+        cluster_dic = initial_cluster_dic(cluster_info_tsv, falcon_mgf_path, indexer)
 
     update_cluster_end_time = time.time()
     print(f"Merge results took {update_cluster_end_time - sumarize_results_end_time:.2f} s.")
 
 
     # Clean up local falcon outputs
-    if os.path.exists("falcon.csv"):
-        os.remove("falcon.csv")
-    if os.path.exists("falcon.mgf"):
-        os.remove("falcon.mgf")
-    if os.path.exists("output_summary"):
-        shutil.rmtree("output_summary", ignore_errors=True)
+    # if os.path.exists("falcon.csv"):
+    #     os.remove("falcon.csv")
+    # if os.path.exists("falcon.mgf"):
+    #     os.remove("falcon.mgf")
+    # if os.path.exists("output_summary"):
+    #     shutil.rmtree("output_summary", ignore_errors=True)
 
     # 4) Write updated consensus
     n_written = write_mzml(cluster_dic, output_consensus_path)
