@@ -21,10 +21,12 @@ import numpy as np
 from csv import DictWriter
 import pyarrow.parquet as pq
 import pyarrow.feather as feather
+from pymzml.obo import OboTranslator
 from numcodecs import VLenArray, Blosc  # Add these imports at the top
 import numcodecs
 import pyarrow as pa
 import concurrent.futures
+import io
 from functools import lru_cache
 from functools import partial
 import gc
@@ -69,83 +71,104 @@ def summarize_output(output_path,summarize_script="summarize_results.py", falcon
 
 
 class MzMLIndexer:
-    """Lazy loader compatible with modern pymzml versions"""
-
     def __init__(self, folder_path):
         self.folder = folder_path
-        self._index = {}  # (base, scan_id) → (file_path, offset)
-        self._file_handles = {}  # file_path: {'offsets': dict, 'reader': Reader}
+        self._index = {}  # Maps filename base to file path
+        self._runs = {}  # Maps file path to open pymzml.run.Reader
+        self._scan_id_types = {}  # Maps file path to 'str' or 'int'
         self._build_index()
 
     def _build_index(self):
-        """Build index using spectrum-specific offsets"""
         for fname in os.listdir(self.folder):
-            if fname.endswith(".mzML") and fname != "consensus.mzML":
-                file_path = os.path.join(self.folder, fname)
-                base = os.path.splitext(fname)[0]
-                offset_dict = {}
+            if fname == "consensus.mzML" or not fname.endswith(".mzML"):
+                continue
+            file_path = os.path.join(self.folder, fname)
+            base = os.path.splitext(fname)[0]
+            self._index[base] = file_path
 
-                # First pass: record MS2 spectrum offsets
-                with pymzml.run.Reader(file_path) as reader:
-                    for spectrum in reader:
-                        if spectrum['ms level'] == 2:
-                            try:
-                                scan_id = spectrum['id']
-                                # Use spectrum's internal offset
-                                offset_dict[scan_id] = spectrum._offset
-                                self._index[(base, scan_id)] = (file_path, spectrum._offset)
-                            except AttributeError:
-                                continue
-
-                # Store offset info for this file
-                self._file_handles[file_path] = {
-                    'offsets': offset_dict,
-                    'reader': None
-                }
-
-    @lru_cache(maxsize=500000)
+    @lru_cache(maxsize=100000)
     def get_spectrum(self, base, scan_id):
-        """Direct spectrum access using stored offsets"""
-        index_entry = self._index.get((base, scan_id))
-        if not index_entry:
+        scan_num = scan_id
+        if not scan_num:
             return None
 
-        file_path, offset = index_entry
-        file_info = self._file_handles.get(file_path)
-        if not file_info:
+        file_path = self._index.get(base)
+        if not file_path:
             return None
 
-        # Lazy initialize reader with offset dict
-        if not file_info['reader']:
-            file_info['reader'] = pymzml.run.Reader(
-                file_path,
-                offset_dict=file_info['offsets']
-            )
+        # Open the file if not already open
+        if file_path not in self._runs:
+            try:
+                run = pymzml.run.Reader(file_path, build_index=True, build_index_from_scratch=True)
+                self._runs[file_path] = run
+            except Exception as e:
+                print(f"Error opening {file_path}: {e}")
+                return None
 
-        try:
-            # Access using native offset handling
-            spectrum = file_info['reader'].get_by_id(scan_id)
-            if spectrum and spectrum['ms level'] == 2:
-                return self._create_spectrum_dict(spectrum)
-        except KeyError:
+        run = self._runs[file_path]
+        scan_type = self._scan_id_types.get(file_path)
+        spectrum = None
+
+        # Determine scan ID type if unknown
+        if scan_type is None:
+            try:
+                spectrum = run[str(scan_num)]
+                self._scan_id_types[file_path] = 'str'
+            except Exception as e:
+                try:
+                    spectrum = run[int(scan_num)]
+                    self._scan_id_types[file_path] = 'int'
+                except Exception as e:
+                    print(f"Error accessing {scan_num} in {file_path}: {e}")
+        else:
+            # Use known scan type
+            if scan_type == 'str':
+                try:
+                    spectrum = run[str(scan_num)]
+                except Exception as e:
+                    print(f"Error accessing stored str type {scan_num} in {file_path}: {e}")
+                    print(scan_type)
+            if scan_type == 'int':
+                try:
+                    spectrum = run[int(scan_num)]
+                except Exception as e:
+                    print(f"Error accessing stored int type {scan_num} in {file_path}: {e}")
+                    print(scan_type)
+        if not spectrum:
+            print(f"Spectrum {scan_num} not found in {file_path}")
             return None
-        return None
+
+        return self._create_spectrum_dict(spectrum)
 
     def _create_spectrum_dict(self, spectrum):
+        precursor = spectrum.selected_precursors[0] if spectrum.selected_precursors else {}
+        rt = spectrum.scan_time[0] if spectrum.scan_time else 0
+
         return {
-            'peaks': [(mz, intensity) for mz, intensity in spectrum.peaks("centroided")],
+            'peaks': list(spectrum.peaks("centroided")),
             'm/z array': spectrum.mz,
             'intensity array': spectrum.i,
-            'precursor_mz': spectrum.selected_precursors[0]['mz'],
-            'rtinseconds': spectrum.scan_time[0],
-            'charge': spectrum.selected_precursors[0].get('charge', 0)
+            'precursor_mz': precursor.get('mz', 0),
+            'rtinseconds': rt,
+            'scans': spectrum['id'],
+            'charge': precursor.get('charge', 0),
         }
 
     def close(self):
-        for fh in self._file_handles.values():
-            if fh['reader']:
-                fh['reader'].close()
-        self._file_handles.clear()
+        for run in self._runs.values():
+            try:
+                run.close()
+            except Exception:
+                pass
+        self._index.clear()
+        self._runs.clear()
+        self._scan_id_types.clear()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
 
 def create_mzml_indexer(folder_path):
     """Create a lazy-loading indexer instead of loading all spectra"""
@@ -231,7 +254,8 @@ def write_mzml(cluster_dic, out_path):
                 write_count += 11
                 data['spec_pool'] = chosen
         except Exception as err:
-            print(f"Error in write_mzml for cluster {cid}: {err}")
+            continue
+            #print(f"Error in write_mzml for cluster {cid}: {err}")
     f = oms.MzMLFile()
     f.store(out_path, exp)
     return write_count
@@ -475,14 +499,17 @@ def update_cluster_dic(cluster_dic, cluster_info_tsv, falcon_mgf, indexer):
 
     # 2) non-consensus, non-neg
     new_key = max(cluster_dic.keys(), default=0)
-    for row in cat_noncons_nonneg:
+    for row in tqdm(cat_noncons_nonneg):
         cid = int(row['cluster'])
         fn = row['filename']
         sc = int(row['scan'])
         pmz= row['precursor_mz']
         rt = row['retention_time']
         base = os.path.splitext(os.path.basename(fn))[0]
-        sp_data = indexer.get_spectrum(base, sc)
+        try:
+            sp_data = indexer.get_spectrum(base, sc)
+        except Exception as e:
+            print("error fetching spectrum", base, sc)
 
         if cid not in currentID_uniID:
             new_key += 1
@@ -494,7 +521,7 @@ def update_cluster_dic(cluster_dic, cluster_info_tsv, falcon_mgf, indexer):
 
     # 3) cluster_id = -1
     new_cluster_id = max(cluster_dic.keys(), default=0)
-    for row in cat_neg:
+    for row in tqdm(cat_neg):
         fn = row['filename']
         sc = int(row['scan'])
         pmz= row['precursor_mz']
@@ -744,6 +771,7 @@ def cluster_one_folder(folder, checkpoint_dir, output_dir, tool_dir, precursor_t
 
     update_cluster_end_time = time.time()
     print(f"Merge results took {update_cluster_end_time - sumarize_results_end_time:.2f} s.")
+    indexer.close()
 
 
     # Clean up local falcon outputs
