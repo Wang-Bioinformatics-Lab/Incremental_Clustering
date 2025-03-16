@@ -126,14 +126,18 @@ class MzMLIndexer:
                 try:
                     spectrum = run[str(scan_num)]
                 except Exception as e:
-                    print(f"Error accessing stored str type {scan_num} in {file_path}: {e}")
-                    print(scan_type)
-            if scan_type == 'int':
+                    try:
+                        spectrum = run[int(scan_num)]
+                    except Exception as e:
+                        print(f"Error accessing stored type {scan_num} in {file_path}: {e}")
+            elif scan_type == 'int':
                 try:
                     spectrum = run[int(scan_num)]
                 except Exception as e:
-                    print(f"Error accessing stored int type {scan_num} in {file_path}: {e}")
-                    print(scan_type)
+                    try:
+                        spectrum = run[str(scan_num)]
+                    except Exception as e:
+                        print(f"Error accessing stored type {scan_num} in {file_path}: {e}")
         if not spectrum:
             print(f"Spectrum {scan_num} not found in {file_path}")
             return None
@@ -184,8 +188,8 @@ def read_mzml(filepath):
         if spectrum['ms level'] == 2:
             spectrum_dict = {
                 'peaks': [],
-                'm/z array': [],
-                'intensity array': [],
+                # 'm/z array': [],
+                # 'intensity array': [],
                 'precursor_mz': spectrum.selected_precursors[0]['mz'],
                 'rtinseconds': spectrum.scan_time[0],
                 'scans': spectrum['id'],
@@ -193,12 +197,12 @@ def read_mzml(filepath):
             }
             for mz, intensity in spectrum.peaks("centroided"):
                 spectrum_dict['peaks'].append((mz, intensity))
-                spectrum_dict['m/z array'].append(mz)
-                spectrum_dict['intensity array'].append(intensity)
+                # spectrum_dict['m/z array'].append(mz)
+                # spectrum_dict['intensity array'].append(intensity)
             spectra.append(spectrum_dict)
     return spectra
 
-def read_mzml_parallel(folder_path, max_workers=4):
+def read_mzml_parallel(folder_path, max_workers=8):
     """
     Reads all *.mzML in a folder (except 'consensus.mzML') in parallel,
     returning a dict ( (basename_no_ext, scan_id) -> spectrum_data ).
@@ -399,7 +403,7 @@ def load_cluster_dic_hdf5_optimized(in_path):
 # 3) UPDATING + MERGING CLUSTER DICS
 ##############################################################################
 
-def initial_cluster_dic(cluster_info_tsv, falcon_mgf, indexer):
+def initial_cluster_dic(cluster_info_tsv, falcon_mgf, spectra_dic):
     """
     Create a cluster_dic from scratch, handling cluster IDs:
     - Non-`-1` clusters retain their original IDs.
@@ -429,7 +433,8 @@ def initial_cluster_dic(cluster_info_tsv, falcon_mgf, indexer):
         pmz = row['precursor_mz']
         rt = row['retention_time']
         base = os.path.splitext(os.path.basename(fn))[0]
-        sp_data = indexer.get_spectrum(base, sc)
+        #sp_data = indexer.get_spectrum(base, sc)
+        sp_data = spectra_dic[(base,sc)]
 
 
         if cid not in cluster_dic:
@@ -446,7 +451,8 @@ def initial_cluster_dic(cluster_info_tsv, falcon_mgf, indexer):
         pmz = row['precursor_mz']
         rt = row['retention_time']
         base = os.path.splitext(os.path.basename(fn))[0]
-        sp_data = indexer.get_spectrum(base, sc)
+        # sp_data = indexer.get_spectrum(base, sc)
+        sp_data = spectra_dic[(base, sc)]
 
         cluster_dic[new_cid] = {
             'scan_list': [(fn, sc, pmz, rt)],
@@ -466,7 +472,7 @@ def initial_cluster_dic(cluster_info_tsv, falcon_mgf, indexer):
 
     return cluster_dic
 
-def update_cluster_dic(cluster_dic, cluster_info_tsv, falcon_mgf, indexer):
+def update_cluster_dic(cluster_dic, cluster_info_tsv, falcon_mgf, spectra_dic):
     """
     Merge newly generated cluster_info into existing cluster_dic
     (i.e., "incremental" approach).
@@ -506,10 +512,11 @@ def update_cluster_dic(cluster_dic, cluster_info_tsv, falcon_mgf, indexer):
         pmz= row['precursor_mz']
         rt = row['retention_time']
         base = os.path.splitext(os.path.basename(fn))[0]
-        try:
-            sp_data = indexer.get_spectrum(base, sc)
-        except Exception as e:
-            print("error fetching spectrum", base, sc)
+        sp_data = spectra_dic[(base, sc)]
+        # try:
+        #     sp_data = indexer.get_spectrum(base, sc)
+        # except Exception as e:
+        #     print("error fetching spectrum", base, sc)
 
         if cid not in currentID_uniID:
             new_key += 1
@@ -527,7 +534,8 @@ def update_cluster_dic(cluster_dic, cluster_info_tsv, falcon_mgf, indexer):
         pmz= row['precursor_mz']
         rt = row['retention_time']
         base = os.path.splitext(os.path.basename(fn))[0]
-        sp_data = indexer.get_spectrum(base, sc)
+        # sp_data = indexer.get_spectrum(base, sc)
+        sp_data = spectra_dic[(base, sc)]
         new_cluster_id += 1
         currentID_uniID[new_cluster_id] = new_cluster_id
         cluster_dic[new_cluster_id] = {'scan_list':[], 'spec_pool':[]}
@@ -588,10 +596,8 @@ def save_cluster_dic_optimized(cluster_dic, out_dir, max_workers=8):
     # 2. Save spec_data with enhanced type validation
     spec_schema = pa.schema([
         ("cluster_id", pa.int32()),
-        ("spec_pool_mz", pa.list_(pa.list_(pa.float32()))),
-        ("spec_pool_intensity", pa.list_(pa.list_(pa.float32()))),
-        ("spectrum_mz", pa.list_(pa.float32())),
-        ("spectrum_intensity", pa.list_(pa.float32())),
+        ("spec_pool_peaks", pa.list_(pa.list_(pa.list_(pa.float32())))),  # 3D: [spectra][peaks][mz/intensity]
+        ("spectrum_peaks", pa.list_(pa.list_(pa.float32()))),  # 2D: [peaks][mz/intensity]
         ("precursor_mz", pa.float32()),
         ("rtinseconds", pa.float32()),
         ("charge", pa.int32()),
@@ -602,18 +608,26 @@ def save_cluster_dic_optimized(cluster_dic, out_dir, max_workers=8):
         cdata = cluster_dic[cid]
         spec = cdata.get("spectrum", {})
 
-        # Robust charge handling
+        # Process spec_pool: list of spectra, each with list of peaks
+        spec_pool_peaks = [
+            [[float(p[0]), float(p[1])] for p in s.get("peaks", [])]
+            for s in cdata.get("spec_pool", [])
+        ]
+
+        # Process spectrum: list of peaks for the representative
+        spectrum_peaks = [
+            [float(p[0]), float(p[1])]
+            for p in spec.get("peaks", [])
+        ]
+
+        # Handle charge
         raw_charge = str(spec.get("charge", "0")).strip('+').strip()
         charge = int(raw_charge) if raw_charge.isdigit() else 0
 
         return {
             "cluster_id": int(cid),
-            "spec_pool_mz": [np.asarray(s["m/z array"], dtype=np.float32).tolist()
-                             for s in cdata.get("spec_pool", [])],
-            "spec_pool_intensity": [np.asarray(s["intensity array"], dtype=np.float32).tolist()
-                                    for s in cdata.get("spec_pool", [])],
-            "spectrum_mz": np.asarray(spec.get("m/z array", []), dtype=np.float32).tolist(),
-            "spectrum_intensity": np.asarray(spec.get("intensity array", []), dtype=np.float32).tolist(),
+            "spec_pool_peaks": spec_pool_peaks,
+            "spectrum_peaks": spectrum_peaks,
             "precursor_mz": float(spec.get("precursor_mz", 0.0)),
             "rtinseconds": float(spec.get("rtinseconds", 0.0)),
             "charge": charge,
@@ -653,20 +667,25 @@ def load_cluster_dic_optimized(in_dir, max_workers=8):
     spec_df = pq.read_table(os.path.join(in_dir, "spec_data.parquet")).to_pandas()
 
     def process_spec_row(row):
-        # Convert charge back to string format
-        charge = f"{row.charge}+" if row.charge > 0 else "0"
+        # Reconstruct spec_pool
+        spec_pool = []
+        for spectrum_peaks in row.spec_pool_peaks:
+            spec_pool.append({
+                "peaks": [tuple(peak) for peak in spectrum_peaks]
+            })
+
+        # Reconstruct spectrum
+        spectrum_data = {
+            "peaks": [tuple(peak) for peak in row.spectrum_peaks],
+            "precursor_mz": row.precursor_mz,
+            "rtinseconds": row.rtinseconds,
+            "charge": f"{row.charge}+" if row.charge > 0 else "0",
+            "title": row.title
+        }
 
         return (row.cluster_id, {
-            "spec_pool": [{"m/z array": mz, "intensity array": inten}
-                          for mz, inten in zip(row.spec_pool_mz, row.spec_pool_intensity)],
-            "spectrum": {
-                "m/z array": row.spectrum_mz,
-                "intensity array": row.spectrum_intensity,
-                "precursor_mz": row.precursor_mz,
-                "rtinseconds": row.rtinseconds,
-                "charge": charge,
-                "title": row.title
-            }
+            "spec_pool": spec_pool,
+            "spectrum": spectrum_data
         })
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -731,8 +750,10 @@ def cluster_one_folder(folder, checkpoint_dir, output_dir, tool_dir, precursor_t
     print(f"Falcon clustering took {falcon_end_time- start_time:.2f} s.")
 
     # Build a dictionary of the spectra in this folder
-    print(f"[cluster_one_folder] Building mzML index for folder: {folder}")
-    indexer = create_mzml_indexer(folder)
+    # print(f"[cluster_one_folder] Building mzML index for folder: {folder}")
+    # indexer = create_mzml_indexer(folder)
+    print(f"[cluster_one_folder] Building spectra dict for folder: {folder}")
+    folder_spec_dic = read_mzml_parallel(folder)
 
     mzml_end_time = time.time()
 
@@ -763,15 +784,18 @@ def cluster_one_folder(folder, checkpoint_dir, output_dir, tool_dir, precursor_t
     if has_checkpoint:
         # incremental
         print("[cluster_one_folder] Performing incremental clustering...")
-        cluster_dic = update_cluster_dic(cluster_dic, cluster_info_tsv, falcon_mgf_path, indexer)
+        cluster_dic = update_cluster_dic(cluster_dic, cluster_info_tsv, falcon_mgf_path, folder_spec_dic)
     else:
         # initial
         print("[cluster_one_folder] Performing initial clustering...")
-        cluster_dic = initial_cluster_dic(cluster_info_tsv, falcon_mgf_path, indexer)
+        cluster_dic = initial_cluster_dic(cluster_info_tsv, falcon_mgf_path, folder_spec_dic)
 
     update_cluster_end_time = time.time()
     print(f"Merge results took {update_cluster_end_time - sumarize_results_end_time:.2f} s.")
-    indexer.close()
+    # del folder_spec_dic  # Explicitly delete the dictionary
+    # gc.collect()  # Force garbage collection
+
+    #indexer.close()
 
 
     # Clean up local falcon outputs

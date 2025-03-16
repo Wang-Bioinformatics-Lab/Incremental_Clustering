@@ -86,17 +86,21 @@ class MzMLIndexer:
         else:
             # Use known scan type
             if scan_type == 'str':
-                print("stored type is str")
                 try:
                     spectrum = run[str(scan_num)]
-                except KeyError:
-                    pass
+                except Exception as e:
+                    try:
+                        spectrum = run[int(scan_num)]
+                    except Exception as e:
+                        print(f"Error accessing {scan_num} in {file_path}: {e}")
             if scan_type == 'int':
-                print("stored type is int")
                 try:
                     spectrum = run[int(scan_num)]
-                except KeyError:
-                    pass
+                except Exception as e:
+                    try:
+                        spectrum = run[str(scan_num)]
+                    except Exception as e:
+                        print(f"Error accessing {scan_num} in {file_path}: {e}")
         if not spectrum:
             print(f"Spectrum {scan_num} not found in {file_path}")
             return None
@@ -137,11 +141,42 @@ class MzMLIndexer:
 def create_mzml_indexer(folder_path):
     """Create a lazy-loading indexer instead of loading all spectra"""
     return MzMLIndexer(folder_path)
+
+def test_all_ms2_scans():
+    base = "Blank_51"
+    file_path = indexer._index.get(base)
+    if not file_path:
+        print(f"File for base {base} not found in the index.")
+        return
+
+    # Open the file using pymzml to iterate through all spectra
+    try:
+        run = pymzml.run.Reader(file_path, build_index=True, build_index_from_scratch=True)
+    except Exception as e:
+        print(f"Error opening {file_path}: {e}")
+        return
+
+    # Collect all MS2 scan IDs
+    ms2_scan_ids = []
+    for spectrum in run:
+        if spectrum.get('ms level') == 2:
+            ms2_scan_ids.append(spectrum['id'])
+    print(f"Found {len(ms2_scan_ids)} MS2 scans in {base}.")
+
+    # Iterate through each MS2 scan and retrieve the spectrum using the indexer
+    for scan_id in tqdm(ms2_scan_ids, desc="Processing MS2 scans"):
+        sp = indexer.get_spectrum(base, scan_id)
+        if sp is not None:
+            pass
+        else:
+            print(f"Failed to retrieve spectrum for scan {scan_id}")
+
 start_time = time.time()
 indexer = create_mzml_indexer('/home/user/LabData/XianghuData/Test_incremental_400/batch_5/')
 end_time = time.time()
 print(f"Total time: {end_time - start_time}")
-spectrum = indexer.get_spectrum("x004_solv4_DDA_POS","scan=1070")
-print(spectrum)
-# spectrum = indexer.get_spectrum("00077E8E7B",1928)
-# print(spectrum)
+spectrum = indexer.get_spectrum("Blank_51","4427")
+# print(spectrum['scans'])
+#test_all_ms2_scans()
+
+
