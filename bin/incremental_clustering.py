@@ -661,6 +661,12 @@ def save_cluster_dic_optimized(cluster_dic, out_dir):
             spec_mz = b''
             spec_int = b''
 
+        raw_charge = str(spectrum.get('charge', '0')).strip('+')
+        try:
+            charge = int(raw_charge)
+        except ValueError:
+            charge = 0
+
         spec_data.append({
             "cluster_id": cid,
             "spec_pool_mz": spec_pool_mz,
@@ -669,7 +675,7 @@ def save_cluster_dic_optimized(cluster_dic, out_dir):
             "spectrum_intensity": spec_int,
             "precursor_mz": np.float32(spectrum.get('precursor_mz', 0)),
             "rtinseconds": np.float32(spectrum.get('rtinseconds', 0)),
-            "charge": np.int32(spectrum.get('charge', 0)).strip('+'),
+            "charge": np.int32(charge),
             "title": str(spectrum.get('title', ''))
         })
 
@@ -693,8 +699,7 @@ def save_cluster_dic_optimized(cluster_dic, out_dir):
         os.path.join(out_dir, "spec_data.parquet"),
         compression='lz4',
         use_dictionary=False,
-        write_statistics=False,
-        use_threads=True
+        write_statistics=False
     )
 
 
