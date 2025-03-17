@@ -8,6 +8,8 @@ Views:
     parameters:
         filename: results/cluster_info.tsv
         columns:
+            -   title: "View"
+            -   data:
             -   title: "precursor_mz"
                 data: precursor_mz
             -   title: "retention_time"
