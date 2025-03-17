@@ -317,87 +317,6 @@ def read_mgf(filename):
                             pass
     return spectra
 
-##############################################################################
-# 2) CLUSTER_DICT Checkpointing
-##############################################################################
-
-def save_cluster_dic_hdf5_optimized(cluster_dic, out_path):
-    with h5py.File(out_path, "w") as f:
-        for cid, cdata in cluster_dic.items():
-            grp = f.create_group(str(cid))
-            # scan_list
-            scan_list_data = []
-            for item in cdata.get("scan_list", []):
-                fn, sc, pmz, rt = item
-                scan_list_data.append((fn, sc, float(pmz), float(rt)))
-            if scan_list_data:
-                dt = np.dtype([
-                    ("filename","S256"),
-                    ("scan","i4"),
-                    ("precursor_mz","f8"),
-                    ("retention_time","f8")
-                ])
-                arr = np.array(scan_list_data, dtype=dt)
-                grp.create_dataset("scan_list", data=arr, compression="gzip", chunks=True)
-
-            # spec_pool
-            sp_pool_data = [
-                np.frombuffer(pickle.dumps(x), dtype="uint8")
-                for x in cdata.get("spec_pool", [])
-            ]
-            if sp_pool_data:
-                ds = grp.create_dataset(
-                    "spec_pool",
-                    (len(sp_pool_data),),
-                    dtype=h5py.vlen_dtype(np.dtype("uint8")),
-                    compression="gzip"
-                )
-                ds[...] = sp_pool_data
-
-            # representative 'spectrum'
-            if "spectrum" in cdata:
-                ser = pickle.dumps(cdata["spectrum"])
-                grp.create_dataset("spectrum", data=np.frombuffer(ser, dtype="uint8"))
-
-            if "title" in cdata:
-                grp.attrs["title"] = cdata["title"]
-
-def load_cluster_dic_hdf5_optimized(in_path):
-    cluster_dic = {}
-    if not os.path.exists(in_path):
-        return cluster_dic
-
-    with h5py.File(in_path, "r") as f:
-        for cid in f:
-            grp = f[cid]
-            cid_int = int(cid)
-            cluster_dic[cid_int] = {
-                "scan_list": [],
-                "spec_pool": [],
-                "spectrum": {}
-            }
-            if "scan_list" in grp:
-                arr = grp["scan_list"][...]
-                for row in arr:
-                    fn   = row["filename"].decode("utf-8")
-                    sc   = row["scan"]
-                    pmz  = row["precursor_mz"]
-                    rt   = row["retention_time"]
-                    cluster_dic[cid_int]["scan_list"].append((fn, sc, pmz, rt))
-
-            if "spec_pool" in grp:
-                for item in grp["spec_pool"]:
-                    spd = pickle.loads(item.tobytes())
-                    cluster_dic[cid_int]["spec_pool"].append(spd)
-
-            if "spectrum" in grp:
-                sp = grp["spectrum"][()]
-                cluster_dic[cid_int]["spectrum"] = pickle.loads(sp.tobytes())
-
-            if "title" in grp.attrs:
-                cluster_dic[cid_int]["title"] = grp.attrs["title"]
-
-    return cluster_dic
 
 ##############################################################################
 # 3) UPDATING + MERGING CLUSTER DICS
@@ -695,6 +614,144 @@ def load_cluster_dic_optimized(in_dir, max_workers=8):
             cluster_dic.setdefault(cid, {}).update(data)
 
     return cluster_dic
+# def save_cluster_dic_optimized(cluster_dic, out_dir):
+#     """Optimized saving with binary peak storage and Arrow-native parallelism"""
+#     os.makedirs(out_dir, exist_ok=True)
+#
+#     # 1. Save scan_list as single Feather file
+#     scan_data = []
+#     for cid, cdata in cluster_dic.items():
+#         for fn, sc, pmz, rt in cdata.get("scan_list", []):
+#             scan_data.append({
+#                 "cluster_id": cid,
+#                 "filename": fn,
+#                 "scan": sc,
+#                 "precursor_mz": np.float32(pmz),
+#                 "retention_time": np.float32(rt)
+#             })
+#
+#     # Convert to Arrow Table and write
+#     scan_table = pa.Table.from_pylist(scan_data)
+#     feather.write_feather(scan_table, os.path.join(out_dir, "scan_list.feather"))
+#
+#     # 2. Save spec_data with binary peak arrays
+#     spec_data = []
+#     for cid, cdata in tqdm(cluster_dic.items(), desc="Saving spec data"):
+#         # Serialize spec_pool peaks
+#         spec_pool_mz = []
+#         spec_pool_intensity = []
+#         for spec in cdata.get("spec_pool", []):
+#             if 'peaks' in spec and len(spec['peaks']) > 0:
+#                 peaks = np.array(spec['peaks'], dtype=np.float32)
+#                 mz_bytes = peaks[:, 0].tobytes()
+#                 int_bytes = peaks[:, 1].tobytes()
+#             else:
+#                 mz_bytes = b''
+#                 int_bytes = b''
+#             spec_pool_mz.append(mz_bytes)
+#             spec_pool_intensity.append(int_bytes)
+#
+#         # Serialize representative spectrum
+#         spectrum = cdata.get("spectrum", {})
+#         if 'peaks' in spectrum and len(spectrum['peaks']) > 0:
+#             spec_peaks = np.array(spectrum['peaks'], dtype=np.float32)
+#             spec_mz = spec_peaks[:, 0].tobytes()
+#             spec_int = spec_peaks[:, 1].tobytes()
+#         else:
+#             spec_mz = b''
+#             spec_int = b''
+#
+#         spec_data.append({
+#             "cluster_id": cid,
+#             "spec_pool_mz": spec_pool_mz,
+#             "spec_pool_intensity": spec_pool_intensity,
+#             "spectrum_mz": spec_mz,
+#             "spectrum_intensity": spec_int,
+#             "precursor_mz": np.float32(spectrum.get('precursor_mz', 0)),
+#             "rtinseconds": np.float32(spectrum.get('rtinseconds', 0)),
+#             "charge": np.int32(spectrum.get('charge', 0)),
+#             "title": str(spectrum.get('title', ''))
+#         })
+#
+#     # Create Arrow schema
+#     schema = pa.schema([
+#         ('cluster_id', pa.int32()),
+#         ('spec_pool_mz', pa.list_(pa.binary())),
+#         ('spec_pool_intensity', pa.list_(pa.binary())),
+#         ('spectrum_mz', pa.binary()),
+#         ('spectrum_intensity', pa.binary()),
+#         ('precursor_mz', pa.float32()),
+#         ('rtinseconds', pa.float32()),
+#         ('charge', pa.int32()),
+#         ('title', pa.string())
+#     ])
+#
+#     # Write to Parquet with optimized settings
+#     spec_table = pa.Table.from_pylist(spec_data, schema=schema)
+#     pq.write_table(
+#         spec_table,
+#         os.path.join(out_dir, "spec_data.parquet"),
+#         compression='lz4',
+#         use_dictionary=False,
+#         write_statistics=False,
+#         use_threads=True
+#     )
+#
+#
+# def load_cluster_dic_optimized(in_dir):
+#     """Optimized loading with binary deserialization"""
+#     cluster_dic = {}
+#     if not os.path.exists(in_dir):
+#         return cluster_dic
+#
+#     # 1. Load scan_list
+#     scan_table = feather.read_table(os.path.join(in_dir, "scan_list.feather"))
+#     scan_df = scan_table.to_pandas()
+#
+#     # Group by cluster_id
+#     for cid, group in scan_df.groupby('cluster_id'):
+#         cluster_dic[cid] = {
+#             "scan_list": [
+#                 (row['filename'], row['scan'], row['precursor_mz'], row['retention_time'])
+#                 for _, row in group.iterrows()
+#             ]
+#         }
+#
+#     # 2. Load spec_data
+#     spec_table = pq.read_table(os.path.join(in_dir, "spec_data.parquet"))
+#     spec_df = spec_table.to_pandas()
+#
+#     for _, row in tqdm(spec_df.iterrows(), total=len(spec_df), desc="Loading clusters"):
+#         cid = row['cluster_id']
+#         if cid not in cluster_dic:
+#             cluster_dic[cid] = {}
+#
+#         # Deserialize spec_pool
+#         spec_pool = []
+#         for mz_bytes, int_bytes in zip(row['spec_pool_mz'], row['spec_pool_intensity']):
+#             if len(mz_bytes) > 0 and len(int_bytes) > 0:
+#                 mz_arr = np.frombuffer(mz_bytes, dtype=np.float32)
+#                 int_arr = np.frombuffer(int_bytes, dtype=np.float32)
+#                 peaks = list(zip(mz_arr, int_arr))
+#                 spec_pool.append({"peaks": peaks})
+#         cluster_dic[cid]["spec_pool"] = spec_pool
+#
+#         # Deserialize representative spectrum
+#         spectrum = {}
+#         if len(row['spectrum_mz']) > 0 and len(row['spectrum_intensity']) > 0:
+#             mz_arr = np.frombuffer(row['spectrum_mz'], dtype=np.float32)
+#             int_arr = np.frombuffer(row['spectrum_intensity'], dtype=np.float32)
+#             spectrum['peaks'] = list(zip(mz_arr, int_arr))
+#
+#         spectrum.update({
+#             'precursor_mz': float(row['precursor_mz']),
+#             'rtinseconds': float(row['rtinseconds']),
+#             'charge': int(row['charge']),
+#             'title': row['title']
+#         })
+#         cluster_dic[cid]["spectrum"] = spectrum
+#
+#     return cluster_dic
 ##############################################################################
 # 4) DRIVER LOGIC: ONE FOLDER AT A TIME
 ##############################################################################

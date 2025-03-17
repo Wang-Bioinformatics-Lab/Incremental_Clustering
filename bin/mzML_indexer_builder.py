@@ -75,12 +75,10 @@ class MzMLIndexer:
             try:
                 spectrum = run[str(scan_num)]
                 self._scan_id_types[file_path] = 'str'
-                print(self._scan_id_types[file_path])
             except Exception as e:
                 try:
                     spectrum = run[int(scan_num)]
                     self._scan_id_types[file_path] = 'int'
-                    print(self._scan_id_types[file_path])
                 except Exception as e:
                     print(f"Error accessing {scan_num} in {file_path}: {e}")
         else:
@@ -92,18 +90,30 @@ class MzMLIndexer:
                     try:
                         spectrum = run[int(scan_num)]
                     except Exception as e:
-                        print(f"Error accessing {scan_num} in {file_path}: {e}")
-            if scan_type == 'int':
+                        print(f"Error accessing stored type {scan_num} in {file_path}: {e}")
+            elif scan_type == 'int':
                 try:
                     spectrum = run[int(scan_num)]
                 except Exception as e:
                     try:
                         spectrum = run[str(scan_num)]
                     except Exception as e:
-                        print(f"Error accessing {scan_num} in {file_path}: {e}")
+                        print(f"Error accessing stored type {scan_num} in {file_path}: {e}")
         if not spectrum:
-            print(f"Spectrum {scan_num} not found in {file_path}")
-            return None
+            print(f"Direct access for scan {scan_num} in {file_path} failed. Iterating over file to locate scan.")
+            try:
+                iteration_run = pymzml.run.Reader(file_path, build_index=True, build_index_from_scratch=True)
+            except Exception as e:
+                print(f"Error reopening {file_path} for iteration: {e}")
+                return None
+            for s in iteration_run:
+                # Compare IDs as strings to be robust against type differences
+                if str(s.get('id')) == str(scan_num):
+                    spectrum = s
+                    break
+            if not spectrum:
+                print(f"Scan {scan_num} not found in {file_path} even after iterating.")
+                return None
 
         return self._create_spectrum_dict(spectrum)
 
@@ -136,7 +146,6 @@ class MzMLIndexer:
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.close()
-
 
 def create_mzml_indexer(folder_path):
     """Create a lazy-loading indexer instead of loading all spectra"""
@@ -176,6 +185,7 @@ indexer = create_mzml_indexer('/home/user/LabData/XianghuData/Test_incremental_4
 end_time = time.time()
 print(f"Total time: {end_time - start_time}")
 spectrum = indexer.get_spectrum("Blank_51","4427")
+print(spectrum['scans'])
 # print(spectrum['scans'])
 #test_all_ms2_scans()
 
