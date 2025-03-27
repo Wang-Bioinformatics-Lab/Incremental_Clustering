@@ -1,85 +1,55 @@
-# Nextflow Template
+# Incremental Mass Spectra Clustering Workflow – User Instructions
 
-To run the workflow to test simply do
+## 1. Parameter Configuration
 
-```
-make run
-```
+Before running the workflow, please ensure the following parameters are set appropriately:
 
-To learn NextFlow checkout this documentation:
+- **Precursor Ion Tolerance**  
+  Specify the tolerance for precursor ion matching. This can be set in **ppm** or **Da**, but the unit must be explicitly defined (e.g., `20 ppm` or `0.5 Da`).
 
-https://www.nextflow.io/docs/latest/index.html
+- **Fragment Ion Tolerance**  
+  Defines the tolerance for fragment ion matching.
 
-## Installation
+- **Minimum Peak Intensity**  
+  Set a threshold below which fragment peaks will be ignored during clustering.
 
-You will need to have conda, mamba, and nextflow installed to run things locally. 
+- **Maximum Peak Intensity**  
+  Set a threshold above which fragment peaks will be excluded to avoid noise or outliers.
 
-## GNPS2 Workflow Input information
+- **EPS (Epsilon for DBSCAN Clustering)**  
+  This parameter controls the cosine distance threshold for clustering (default: `0.1`).  
+  Recommended range for cosine distance: **0.1 to 0.3**, depending on the desired clustering granularity.
 
-Check the definition for the workflow input and display parameters:
-https://wang-bioinformatics-lab.github.io/GNPS2_Documentation/workflowdev/
+---
 
+## 2. Initial Clustering Workflow
 
-## Deployment to GNPS2
+To run the clustering workflow for a new dataset:
 
-In order to deploy, we have a set of deployment tools that will enable deployment to the various gnps2 systems. To run the deployment, you will need the following setup steps completed:
+1. Navigate to the workflow interface.
+2. Under **Input Data Folder**, select the folder containing your `mzML` spectra files.
+3. Click **Submit** to start the clustering process.
 
-1. Checked out of the deployment submodules
-1. Conda environment and dependencies
-1. SSH configuration updated
+---
 
-### Checking out the deployment submodules
+## 3. Incremental Clustering Workflow
 
-use the following commands from the deploy_gnps2 folder. 
+To cluster a new batch of spectra incrementally based on previous results:
 
-You might need to checkout the module, do this by running
+1. Wait for the previous batch to complete. On the **Task Finished** page, click:  
+   **Downstream Analysis → Downstream Analysis - Run Incremental Clustering Batch**
+2. On the next page:
+   - The **Input Checkpoint Folder** should automatically populate with the results from the previous batch.
+   - In **Input Data Folder**, select the folder containing the new batch of spectra.
+3. Click **Submit** to begin incremental clustering.
 
-```
-git submodule init
-git submodule update
-```
+---
 
-You will also need to specify the user on the server that you've been given that your public key has been associated with. If you want to not enter this every time you do a deployment, you can create a Makefile.credentials file in the deploy_gnps2 folder with the following contents
+## 4. Viewing Clustering Results
 
-```
-USERNAME=<enter the username>
-```
-
-### Deployment Dependencies
-
-You will need to install the dependencies in GNPS2_DeploymentTooling/requirements.txt on your own local machine. 
-
-You can find this [here](https://github.com/Wang-Bioinformatics-Lab/GNPS2_DeploymentTooling).
-
-One way to do this is to use conda to create an environment, for example:
-
-```
-conda create -n deploy python=3.8
-pip install -r GNPS2_DeploymentTooling/requirements.txt
-```
-
-### SSH Configuration
-
-Also update your ssh config file to include the following ssh target:
-
-```
-Host ucr-gnps2-dev
-    Hostname ucr-lemon.duckdns.org
-```
-
-### Deploying to Dev Server
-
-To deploy to development, use the following command, if you don't have your ssh public key installed onto the server, you will not be able to deploy.
-
-```
-make deploy-dev
-```
-
-### Deploying to Production Server
-
-To deploy to production, use the following command, if you don't have your ssh public key installed onto the server, you will not be able to deploy.
-
-```
-make deploy-prod
-```
+- On the **Task Page**, click **Clustering Output List** to view clustering results organized by scan.
+- To download or browse the **Consensus Spectrum File**, go to:  
+  **Browse All Results**  
+  The file is located at:  
+  `/results/consensus.mzML`
 
