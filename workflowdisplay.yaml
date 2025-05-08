@@ -39,7 +39,7 @@ Views:
 
 -   name: Downstream Analysis - Incremental Clustering Batch
     displayname: Downstream Analysis - Run Incremental Clustering Batch
-    viewname: downstreamtransitive
+    viewname: downstreamincrementalclustering
     displaytype: linkout
     parameters:
         baseurl: /workflowinput
@@ -47,4 +47,15 @@ Views:
             -   workflowname:incremental_clustering_nextflow_workflow
         hashparam:
             -   checkpoint_dir:TASKLOCATION/[task]/results/
+
+-   name: Downstream Analysis - Network Barebone
+    displayname: Downstream Analysis - Run Network Barebone
+    viewname: downstreamnetworkbarebone
+    displaytype: linkout
+    parameters:
+        baseurl: /workflowinput
+        urlparam:
+            -   workflowname:networking_barebone_workflow
+        hashparam:
+            -   inputspectra:TASKLOCATION/[task]/results/consensus.mzML
 

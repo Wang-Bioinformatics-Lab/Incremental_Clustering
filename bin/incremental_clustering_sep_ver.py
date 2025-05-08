@@ -25,6 +25,8 @@ from pymzml.obo import OboTranslator
 from numcodecs import VLenArray, Blosc  # Add these imports at the top
 import numcodecs
 import pyarrow as pa
+from collections import defaultdict
+import hashlib
 import concurrent.futures
 import io
 from functools import lru_cache
@@ -69,114 +71,8 @@ def summarize_output(output_path,summarize_script="summarize_results.py", falcon
     proc.wait()
     return os.path.join(output_dir, "cluster_info.tsv")
 
-
-class MzMLIndexer:
-    def __init__(self, folder_path):
-        self.folder = folder_path
-        self._index = {}  # Maps filename base to file path
-        self._runs = {}  # Maps file path to open pymzml.run.Reader
-        self._scan_id_types = {}  # Maps file path to 'str' or 'int'
-        self._build_index()
-
-    def _build_index(self):
-        for fname in os.listdir(self.folder):
-            if fname == "consensus.mzML" or not fname.endswith(".mzML"):
-                continue
-            file_path = os.path.join(self.folder, fname)
-            base = os.path.splitext(fname)[0]
-            self._index[base] = file_path
-
-    @lru_cache(maxsize=100000)
-    def get_spectrum(self, base, scan_id):
-        scan_num = scan_id
-        if not scan_num:
-            return None
-
-        file_path = self._index.get(base)
-        if not file_path:
-            return None
-
-        # Open the file if not already open
-        if file_path not in self._runs:
-            try:
-                run = pymzml.run.Reader(file_path, build_index=True, build_index_from_scratch=True)
-                self._runs[file_path] = run
-            except Exception as e:
-                print(f"Error opening {file_path}: {e}")
-                return None
-
-        run = self._runs[file_path]
-        scan_type = self._scan_id_types.get(file_path)
-        spectrum = None
-
-        # Determine scan ID type if unknown
-        if scan_type is None:
-            try:
-                spectrum = run[str(scan_num)]
-                self._scan_id_types[file_path] = 'str'
-            except Exception as e:
-                try:
-                    spectrum = run[int(scan_num)]
-                    self._scan_id_types[file_path] = 'int'
-                except Exception as e:
-                    print(f"Error accessing {scan_num} in {file_path}: {e}")
-        else:
-            # Use known scan type
-            if scan_type == 'str':
-                try:
-                    spectrum = run[str(scan_num)]
-                except Exception as e:
-                    try:
-                        spectrum = run[int(scan_num)]
-                    except Exception as e:
-                        print(f"Error accessing stored type {scan_num} in {file_path}: {e}")
-            elif scan_type == 'int':
-                try:
-                    spectrum = run[int(scan_num)]
-                except Exception as e:
-                    try:
-                        spectrum = run[str(scan_num)]
-                    except Exception as e:
-                        print(f"Error accessing stored type {scan_num} in {file_path}: {e}")
-        if not spectrum:
-            print(f"Spectrum {scan_num} not found in {file_path}")
-            return None
-
-        return self._create_spectrum_dict(spectrum)
-
-    def _create_spectrum_dict(self, spectrum):
-        precursor = spectrum.selected_precursors[0] if spectrum.selected_precursors else {}
-        rt = spectrum.scan_time[0] if spectrum.scan_time else 0
-
-        return {
-            'peaks': list(spectrum.peaks("centroided")),
-            'm/z array': spectrum.mz,
-            'intensity array': spectrum.i,
-            'precursor_mz': precursor.get('mz', 0),
-            'rtinseconds': rt,
-            'scans': spectrum['id'],
-            'charge': precursor.get('charge', 0),
-        }
-
-    def close(self):
-        for run in self._runs.values():
-            try:
-                run.close()
-            except Exception:
-                pass
-        self._index.clear()
-        self._runs.clear()
-        self._scan_id_types.clear()
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        self.close()
-
-def create_mzml_indexer(folder_path):
-    """Create a lazy-loading indexer instead of loading all spectra"""
-    return MzMLIndexer(folder_path)
+def get_original_file_path(filename,original_filepah):
+    return os.path.join(original_filepah,filename)
 
 def read_mzml(filepath):
     """
@@ -234,35 +130,156 @@ def _read_mzml_file(filepath):
     return out
 
 def write_mzml(cluster_dic, out_path):
-    """
-    Writes a "consensus.mzML" from the cluster_dic. If a cluster has >=10 spectra,
-    it samples them. Returns count of total spectra written.
-    """
-    exp = oms.MSExperiment()
-    write_count = 0
+
+    ref_write = {} #cid:spectrum data
+    fetch_write = defaultdict(list) #filepath:(scan in original file, scan id need to be written into the consensus.mzML file)
     for cid, data in cluster_dic.items():
-        try:
-            n_pool = len(data['spec_pool'])
-            if n_pool < 10:
-                # Use single 'spectrum'
-                sp_data = data['spectrum']
-                _add_spectrum(exp, sp_data, cid)
-                write_count += 1
+        n_pool = len(data['scan_list'])
+        if (n_pool <= 5) and (n_pool > 1):
+            if 'spectrum' in data:
+                ref_write[cid] = data['spectrum']
+        if (n_pool == 1):
+            if data['scan_list']:  # Check if scan list is not empty
+                fp, sc = data['scan_list'][0]  # Unpack first (only) entry
+                fetch_write[fp].append((sc, cid))
+        if (n_pool > 5):
+            chosen = random.sample(data['scan_list'], 5)
+            if 'spectrum' in data:
+                ref_write[cid] = data['spectrum']
+            _id = 1
+            for c in chosen:
+                new_id = f"{cid}_{_id}"
+                fetch_write[c[0]].append((c[1],new_id))
+                _id = _id + 1
+
+    temp_dir = Path(out_path).parent / "temp_consensus"
+    temp_dir.mkdir(exist_ok=True)
+
+    # Process reference spectra
+    exp_final = oms.MSExperiment()
+    if ref_write:
+        exp_ref = oms.MSExperiment()
+        for cid, sp_data in ref_write.items():
+            _add_spectrum(exp_ref, sp_data, cid)
+        exp_final = exp_ref  # Initialize with reference spectra
+
+    # Process fetched spectra
+    if fetch_write:
+        tasks = []
+        for fp, scans in fetch_write.items():
+            if Path(fp).exists():
+                tasks.append((fp, scans, temp_dir))
             else:
-                # sample 10 from spec_pool + the 'spectrum'
-                chosen = random.sample(data['spec_pool'], 10)
-                chosen.append(data['spectrum'])
-                for i, sp_data in enumerate(chosen, start=1):
-                    new_id = f"{cid}_{i}"
-                    _add_spectrum(exp, sp_data, new_id)
-                write_count += 11
-                data['spec_pool'] = chosen
-        except Exception as err:
-            continue
-            #print(f"Error in write_mzml for cluster {cid}: {err}")
-    f = oms.MzMLFile()
-    f.store(out_path, exp)
-    return write_count
+                print(f"File not found: {fp}")
+
+        with Pool(processes=min(16, os.cpu_count())) as pool:
+            temp_files = pool.starmap(_process_fetch_file, tasks)
+
+        # Merge results using OpenMS tools
+        for temp_file in filter(None, temp_files):
+            temp_path = Path(temp_file)
+            if temp_path.exists():
+                temp_exp = oms.MSExperiment()
+                oms.MzMLFile().load(str(temp_path), temp_exp)
+                for spec in temp_exp.getSpectra():
+                    exp_final.addSpectrum(spec)
+                temp_path.unlink()
+            else:
+                print(f"[Warning] Temp file not found (skipping): {temp_file}")
+
+    # Write final output
+    oms.MzMLFile().store(out_path, exp_final)
+    shutil.rmtree(temp_dir, ignore_errors=True)
+    return exp_final.size()
+
+
+def _process_fetch_file(file_path, scan_pairs, temp_dir):
+    """Process a single file with enhanced error handling"""
+    try:
+        exp = oms.MSExperiment()
+        run = pymzml.run.Reader(file_path, build_index_from_scratch=True)
+
+        # Create scan map ensuring pairs are iterable
+        scan_map = {}
+        for pair in scan_pairs:
+            if isinstance(pair, (list, tuple)) and len(pair) == 2:
+                scan_map[pair[0]] = pair[1]
+            else:
+                print(f"Invalid scan pair format: {pair}")
+                continue
+
+        for spectrum in run:
+            scan_id = int(spectrum['id'])
+            if spectrum['ms level'] != 2:
+                continue
+            if scan_id in scan_map:
+                oms_spec = oms.MSSpectrum()
+
+                # Add metadata
+                oms_spec.setNativeID(f"scan={scan_map[scan_id]}")
+                oms_spec.setMSLevel(2)
+
+                # Set retention time
+                if spectrum.scan_time:
+                    rt, unit = spectrum.scan_time
+                    oms_spec.setRT(rt * 60 if unit == 'minute' else rt)
+
+                # Add precursor info
+                if spectrum.selected_precursors:
+                    precursor = oms.Precursor()
+                    precursor.setMZ(spectrum.selected_precursors[0]['mz'])
+                    precursor.setCharge(spectrum.selected_precursors[0].get('charge', 1))
+                    oms_spec.setPrecursors([precursor])
+
+                # Add peaks
+                raw_peaks = spectrum.peaks("centroided")
+
+                if raw_peaks is not None and len(raw_peaks) > 0:
+                    clean_peaks = []
+                    for peak in raw_peaks:
+                        if len(peak) != 2:
+                            print(f"Skipping invalid peak tuple in {file_path} scan {scan_id}: {peak}")
+                            continue
+                        try:
+                            mz_val, int_val = peak
+                            mz_f = float(mz_val)
+                            int_f = float(int_val)
+                            if np.isfinite(mz_f) and np.isfinite(int_f):
+                                clean_peaks.append((mz_f, int_f))
+                        except:
+                            print(f"Invalid peak values in {file_path} scan {scan_id}: {peak}")
+
+                    if len(clean_peaks) > 0:
+                        # Convert to numpy array and validate shape
+                        peaks_array = np.array(clean_peaks, dtype=np.float64)
+                        if peaks_array.ndim != 2 or peaks_array.shape[1] != 2:
+                            print(f"Invalid peak array shape in {file_path} scan {scan_id}")
+                            continue
+
+                        mz = peaks_array[:, 0]
+                        intensity = peaks_array[:, 1]
+
+                        # Final validation check
+                        if len(mz) != len(intensity):
+                            print(f"Critical error: Array length mismatch in {file_path} scan {scan_id}")
+                            continue
+
+                        oms_spec.set_peaks((mz, intensity))
+                        exp.addSpectrum(oms_spec)
+
+        if exp.size() > 0:
+            file_hash = hashlib.md5(file_path.encode()).hexdigest()[:8]
+            output_path = temp_dir / f"{Path(file_path).stem}_{file_hash}_temp.mzML"
+            oms.MzMLFile().store(str(output_path), exp)
+            return str(output_path)
+
+        if exp.size() == 0:
+            print(f"[Info] No matching spectra found in file: {file_path}, skipping writing temp mzML.")
+
+    except Exception as e:
+        print(f"Error processing {file_path}: {str(e)}")
+    return None
+
 
 def _add_spectrum(experiment, sp_data, scan_id):
     """
@@ -322,7 +339,7 @@ def read_mgf(filename):
 # 3) UPDATING + MERGING CLUSTER DICS
 ##############################################################################
 
-def initial_cluster_dic(cluster_info_tsv, falcon_mgf, spectra_dic):
+def initial_cluster_dic(cluster_info_tsv, falcon_mgf, original_file_path):
     """
     Create a cluster_dic from scratch, handling cluster IDs:
     - Non-`-1` clusters retain their original IDs.
@@ -349,17 +366,14 @@ def initial_cluster_dic(cluster_info_tsv, falcon_mgf, spectra_dic):
         cid = int(row['cluster'])
         fn = row['filename']
         sc = int(row['scan'])
-        pmz = row['precursor_mz']
-        rt = row['retention_time']
-        base = os.path.splitext(os.path.basename(fn))[0]
-        #sp_data = indexer.get_spectrum(base, sc)
-        sp_data = spectra_dic[(base,sc)]
+        # pmz = row['precursor_mz']
+        # rt = row['retention_time']
+        fp = get_original_file_path(fn,original_file_path)
 
 
         if cid not in cluster_dic:
             cluster_dic[cid] = {'scan_list': [], 'spec_pool': []}
-        cluster_dic[cid]['scan_list'].append((fn, sc, pmz, rt))
-        cluster_dic[cid]['spec_pool'].append(sp_data)
+        cluster_dic[cid]['scan_list'].append((fp, sc))
 
     # Process neg clusters (assign new IDs sequentially)
     for row in neg_rows:
@@ -367,16 +381,13 @@ def initial_cluster_dic(cluster_info_tsv, falcon_mgf, spectra_dic):
         new_cid = current_max_id
         fn = row['filename']
         sc = int(row['scan'])
-        pmz = row['precursor_mz']
-        rt = row['retention_time']
-        base = os.path.splitext(os.path.basename(fn))[0]
-        # sp_data = indexer.get_spectrum(base, sc)
-        sp_data = spectra_dic[(base, sc)]
+        # pmz = row['precursor_mz']
+        # rt = row['retention_time']
+        fp = get_original_file_path(fn, original_file_path)
 
         cluster_dic[new_cid] = {
-            'scan_list': [(fn, sc, pmz, rt)],
-            'spec_pool': [sp_data],
-            'spectrum': sp_data  # Initial representative
+            'scan_list': [(fp, sc)],
+            'spec_pool': [],
         }
 
     # Attach Falcon MGF reps (use original IDs directly)
@@ -385,13 +396,12 @@ def initial_cluster_dic(cluster_info_tsv, falcon_mgf, spectra_dic):
         original_cid = int(spectrum['cluster'])
         if original_cid in cluster_dic:
             cluster_dic[original_cid]['spectrum'] = spectrum
-            cluster_dic[original_cid]['title'] = spectrum['title']
         else:
             print(f"Cluster {original_cid} not found, skipping.")
 
     return cluster_dic
 
-def update_cluster_dic(cluster_dic, cluster_info_tsv, falcon_mgf, spectra_dic):
+def update_cluster_dic(cluster_dic, cluster_info_tsv, falcon_mgf, original_file_path):
     """
     Merge newly generated cluster_info into existing cluster_dic
     (i.e., "incremental" approach).
@@ -428,10 +438,10 @@ def update_cluster_dic(cluster_dic, cluster_info_tsv, falcon_mgf, spectra_dic):
         cid = int(row['cluster'])
         fn = row['filename']
         sc = int(row['scan'])
-        pmz= row['precursor_mz']
-        rt = row['retention_time']
-        base = os.path.splitext(os.path.basename(fn))[0]
-        sp_data = spectra_dic[(base, sc)]
+        # pmz= row['precursor_mz']
+        # rt = row['retention_time']
+        fp = get_original_file_path(fn, original_file_path)
+
         # try:
         #     sp_data = indexer.get_spectrum(base, sc)
         # except Exception as e:
@@ -442,25 +452,22 @@ def update_cluster_dic(cluster_dic, cluster_info_tsv, falcon_mgf, spectra_dic):
             currentID_uniID[cid] = new_key
             cluster_dic[new_key] = {'scan_list':[], 'spec_pool':[]}
         mapped_cid = currentID_uniID[cid]
-        cluster_dic[mapped_cid]['scan_list'].append((fn, sc, pmz, rt))
-        cluster_dic[mapped_cid]['spec_pool'].append(sp_data)
+        cluster_dic[mapped_cid]['scan_list'].append((fp, sc))
+
 
     # 3) cluster_id = -1
     new_cluster_id = max(cluster_dic.keys(), default=0)
     for row in tqdm(cat_neg):
         fn = row['filename']
         sc = int(row['scan'])
-        pmz= row['precursor_mz']
-        rt = row['retention_time']
-        base = os.path.splitext(os.path.basename(fn))[0]
-        # sp_data = indexer.get_spectrum(base, sc)
-        sp_data = spectra_dic[(base, sc)]
+        # pmz= row['precursor_mz']
+        # rt = row['retention_time']
+        fp = get_original_file_path(fn, original_file_path)
+
         new_cluster_id += 1
         currentID_uniID[new_cluster_id] = new_cluster_id
         cluster_dic[new_cluster_id] = {'scan_list':[], 'spec_pool':[]}
-        cluster_dic[new_cluster_id]['scan_list'].append((fn, sc, pmz, rt))
-        cluster_dic[new_cluster_id]['spec_pool'].append(sp_data)
-        cluster_dic[new_cluster_id]['spectrum'] = sp_data
+        cluster_dic[new_cluster_id]['scan_list'].append((fp, sc))
 
     # attach falcon mgf reps
     mgf_spectra = read_mgf(falcon_mgf)
@@ -470,237 +477,64 @@ def update_cluster_dic(cluster_dic, cluster_info_tsv, falcon_mgf, spectra_dic):
             if old_cid in currentID_uniID:
                 new_cid = currentID_uniID[old_cid]
                 cluster_dic[new_cid]['spectrum'] = s
-                cluster_dic[new_cid]['title'] = s['title']
         except KeyError:
             print(old_cid, s['title'])
 
     return cluster_dic
 
-# def save_cluster_dic_optimized(cluster_dic, out_dir, max_workers=8):
-#     """Optimized saving with robust type handling"""
-#     os.makedirs(out_dir, exist_ok=True)
-#
-#     # 1. Save scan_list with strict schema enforcement
-#     scan_schema = pa.schema([
-#         ("cluster_id", pa.int32()),
-#         ("filename", pa.string()),
-#         ("scan", pa.int32()),
-#         ("precursor_mz", pa.float32()),
-#         ("retention_time", pa.float32())
-#     ])
-#
-#     def create_scan_chunk(chunk):
-#         data = []
-#         for cid, cdata in chunk:
-#             for fn, sc, pmz, rt in cdata.get("scan_list", []):
-#                 data.append({
-#                     "cluster_id": int(cid),
-#                     "filename": str(fn),
-#                     "scan": int(sc),
-#                     "precursor_mz": float(pmz),
-#                     "retention_time": float(rt)
-#                 })
-#         return pa.RecordBatch.from_pylist(data, schema=scan_schema)
-#
-#     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-#         chunks = np.array_split(list(cluster_dic.items()), max_workers)
-#         record_batches = list(executor.map(create_scan_chunk, chunks))
-#
-#         with pa.OSFile(os.path.join(out_dir, "scan_list.feather"), "wb") as sink:
-#             with pa.ipc.new_file(sink, scan_schema) as writer:
-#                 for rb in record_batches:
-#                     if rb and len(rb) > 0:
-#                         writer.write(rb)
-#
-#     # 2. Save spec_data with enhanced type validation
-#     spec_schema = pa.schema([
-#         ("cluster_id", pa.int32()),
-#         ("spec_pool_peaks", pa.list_(pa.list_(pa.list_(pa.float32())))),  # 3D: [spectra][peaks][mz/intensity]
-#         ("spectrum_peaks", pa.list_(pa.list_(pa.float32()))),  # 2D: [peaks][mz/intensity]
-#         ("precursor_mz", pa.float32()),
-#         ("rtinseconds", pa.float32()),
-#         ("charge", pa.int32()),
-#         ("title", pa.string())
-#     ])
-#
-#     def create_spec_entry(cid):
-#         cdata = cluster_dic[cid]
-#         spec = cdata.get("spectrum", {})
-#
-#         # Process spec_pool: list of spectra, each with list of peaks
-#         spec_pool_peaks = [
-#             [[float(p[0]), float(p[1])] for p in s.get("peaks", [])]
-#             for s in cdata.get("spec_pool", [])
-#         ]
-#
-#         # Process spectrum: list of peaks for the representative
-#         spectrum_peaks = [
-#             [float(p[0]), float(p[1])]
-#             for p in spec.get("peaks", [])
-#         ]
-#
-#         # Handle charge
-#         raw_charge = str(spec.get("charge", "0")).strip('+').strip()
-#         charge = int(raw_charge) if raw_charge.isdigit() else 0
-#
-#         return {
-#             "cluster_id": int(cid),
-#             "spec_pool_peaks": spec_pool_peaks,
-#             "spectrum_peaks": spectrum_peaks,
-#             "precursor_mz": float(spec.get("precursor_mz", 0.0)),
-#             "rtinseconds": float(spec.get("rtinseconds", 0.0)),
-#             "charge": charge,
-#             "title": str(spec.get("title", ""))
-#         }
-#
-#     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-#         spec_data = list(tqdm(executor.map(create_spec_entry, cluster_dic.keys()),
-#                               desc="Saving spec data", total=len(cluster_dic)))
-#
-#         spec_table = pa.Table.from_pylist(spec_data, schema=spec_schema)
-#         pq.write_table(spec_table, os.path.join(out_dir, "spec_data.parquet"),
-#                        compression='ZSTD', use_dictionary=True)
-#
-#
-# def load_cluster_dic_optimized(in_dir, max_workers=8):
-#     """Optimized loading with complete data reconstruction"""
-#     cluster_dic = {}
-#     if not os.path.exists(in_dir):
-#         return cluster_dic
-#
-#     # 1. Load and process scan_list
-#     scan_df = feather.read_feather(os.path.join(in_dir, "scan_list.feather"))
-#
-#     def process_scan_chunk(chunk):
-#         return chunk.groupby('cluster_id')[['filename', 'scan', 'precursor_mz', 'retention_time']] \
-#             .apply(lambda x: x.values.tolist()) \
-#             .to_dict()
-#
-#     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-#         chunks = np.array_split(scan_df, max_workers)
-#         for result in executor.map(process_scan_chunk, chunks):
-#             for cid, scans in result.items():
-#                 cluster_dic.setdefault(cid, {}).setdefault("scan_list", []).extend(scans)
-#
-#     # 2. Load and process spec_data
-#     spec_df = pq.read_table(os.path.join(in_dir, "spec_data.parquet")).to_pandas()
-#
-#     def process_spec_row(row):
-#         # Reconstruct spec_pool
-#         spec_pool = []
-#         for spectrum_peaks in row.spec_pool_peaks:
-#             spec_pool.append({
-#                 "peaks": [tuple(peak) for peak in spectrum_peaks]
-#             })
-#
-#         # Reconstruct spectrum
-#         spectrum_data = {
-#             "peaks": [tuple(peak) for peak in row.spectrum_peaks],
-#             "precursor_mz": row.precursor_mz,
-#             "rtinseconds": row.rtinseconds,
-#             "charge": f"{row.charge}+" if row.charge > 0 else "0",
-#             "title": row.title
-#         }
-#
-#         return (row.cluster_id, {
-#             "spec_pool": spec_pool,
-#             "spectrum": spectrum_data
-#         })
-#
-#     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-#         futures = [executor.submit(process_spec_row, row) for row in spec_df.itertuples()]
-#         for future in concurrent.futures.as_completed(futures):
-#             cid, data = future.result()
-#             cluster_dic.setdefault(cid, {}).update(data)
-#
-#     return cluster_dic
+
 def save_cluster_dic_optimized(cluster_dic, out_dir):
     """Optimized saving with binary peak storage and Arrow-native parallelism"""
     os.makedirs(out_dir, exist_ok=True)
 
-    # 1. Save scan_list as single Feather file
+    # 1. Save ALL scan lists regardless of spectrum presence
     scan_data = []
     for cid, cdata in cluster_dic.items():
-        for fn, sc, pmz, rt in cdata.get("scan_list", []):
+        for fp, sc in cdata.get("scan_list", []):
             scan_data.append({
                 "cluster_id": cid,
-                "filename": fn,
-                "scan": sc,
-                "precursor_mz": np.float32(pmz),
-                "retention_time": np.float32(rt)
+                "filename": fp,
+                "scan": sc
             })
 
-    # Convert to Arrow Table and write
     scan_table = pa.Table.from_pylist(scan_data)
     feather.write_feather(scan_table, os.path.join(out_dir, "scan_list.feather"))
 
-    # 2. Save spec_data with binary peak arrays
+    # 2. Save spectrum data only when present
     spec_data = []
-    for cid, cdata in tqdm(cluster_dic.items(), desc="Saving spec data"):
-        # Serialize spec_pool peaks
-        spec_pool_mz = []
-        spec_pool_intensity = []
-        for spec in cdata.get("spec_pool", []):
-            if 'peaks' in spec and len(spec['peaks']) > 0:
-                peaks = np.array(spec['peaks'], dtype=np.float32)
-                mz_bytes = peaks[:, 0].tobytes()
-                int_bytes = peaks[:, 1].tobytes()
-            else:
-                mz_bytes = b''
-                int_bytes = b''
-            spec_pool_mz.append(mz_bytes)
-            spec_pool_intensity.append(int_bytes)
+    for cid, cdata in cluster_dic.items():
+        spectrum = cdata.get("spectrum")
+        if spectrum and 'peaks' in spectrum and len(spectrum['peaks']) > 0:
+            peaks = np.array(spectrum['peaks'], dtype=np.float32)
+            ch_str = str(spectrum.get('charge', '0')).replace('+', '')
+            charge_val = int(ch_str) if ch_str.isdigit() else 0
+            spec_data.append({
+                "cluster_id": cid,
+                "spectrum_mz": peaks[:, 0].tobytes(),
+                "spectrum_intensity": peaks[:, 1].tobytes(),
+                "precursor_mz": np.float32(spectrum.get('precursor_mz', 0)),
+                "rtinseconds": np.float32(spectrum.get('rtinseconds', 0)),
+                "charge": np.int32(charge_val),
+                "title": str(spectrum.get('title', ''))
+            })
 
-        # Serialize representative spectrum
-        spectrum = cdata.get("spectrum", {})
-        if 'peaks' in spectrum and len(spectrum['peaks']) > 0:
-            spec_peaks = np.array(spectrum['peaks'], dtype=np.float32)
-            spec_mz = spec_peaks[:, 0].tobytes()
-            spec_int = spec_peaks[:, 1].tobytes()
-        else:
-            spec_mz = b''
-            spec_int = b''
-
-        raw_charge = str(spectrum.get('charge', '0')).strip('+')
-        try:
-            charge = int(raw_charge)
-        except ValueError:
-            charge = 0
-
-        spec_data.append({
-            "cluster_id": cid,
-            "spec_pool_mz": spec_pool_mz,
-            "spec_pool_intensity": spec_pool_intensity,
-            "spectrum_mz": spec_mz,
-            "spectrum_intensity": spec_int,
-            "precursor_mz": np.float32(spectrum.get('precursor_mz', 0)),
-            "rtinseconds": np.float32(spectrum.get('rtinseconds', 0)),
-            "charge": np.int32(charge),
-            "title": str(spectrum.get('title', ''))
-        })
-
-    # Create Arrow schema
-    schema = pa.schema([
-        ('cluster_id', pa.int32()),
-        ('spec_pool_mz', pa.list_(pa.binary())),
-        ('spec_pool_intensity', pa.list_(pa.binary())),
-        ('spectrum_mz', pa.binary()),
-        ('spectrum_intensity', pa.binary()),
-        ('precursor_mz', pa.float32()),
-        ('rtinseconds', pa.float32()),
-        ('charge', pa.int32()),
-        ('title', pa.string())
-    ])
-
-    # Write to Parquet with optimized settings
-    spec_table = pa.Table.from_pylist(spec_data, schema=schema)
-    pq.write_table(
-        spec_table,
-        os.path.join(out_dir, "spec_data.parquet"),
-        compression='lz4',
-        use_dictionary=False,
-        write_statistics=False
-    )
+    if spec_data:
+        schema = pa.schema([
+            ('cluster_id', pa.int32()),
+            ('spectrum_mz', pa.binary()),
+            ('spectrum_intensity', pa.binary()),
+            ('precursor_mz', pa.float32()),
+            ('rtinseconds', pa.float32()),
+            ('charge', pa.int32()),
+            ('title', pa.string())
+        ])
+        spec_table = pa.Table.from_pylist(spec_data, schema=schema)
+        pq.write_table(
+            spec_table,
+            os.path.join(out_dir, "spec_data.parquet"),
+            compression='zstd',
+            compression_level=3
+        )
 
 
 def load_cluster_dic_optimized(in_dir):
@@ -709,52 +543,29 @@ def load_cluster_dic_optimized(in_dir):
     if not os.path.exists(in_dir):
         return cluster_dic
 
-    # 1. Load scan_list
-    scan_table = feather.read_table(os.path.join(in_dir, "scan_list.feather"))
-    scan_df = scan_table.to_pandas()
+    # 1. Load ALL scan lists first
+    scan_path = os.path.join(in_dir, "scan_list.feather")
+    if os.path.exists(scan_path):
+        scan_df = feather.read_table(scan_path).to_pandas()
+        for row in scan_df.itertuples():
+            cluster_dic.setdefault(row.cluster_id, {'scan_list': []})
+            cluster_dic[row.cluster_id]['scan_list'].append((row.filename, row.scan))
 
-    # Group by cluster_id
-    for cid, group in scan_df.groupby('cluster_id'):
-        cluster_dic[cid] = {
-            "scan_list": [
-                (row['filename'], row['scan'], row['precursor_mz'], row['retention_time'])
-                for _, row in group.iterrows()
-            ]
-        }
-
-    # 2. Load spec_data
-    spec_table = pq.read_table(os.path.join(in_dir, "spec_data.parquet"))
-    spec_df = spec_table.to_pandas()
-
-    for _, row in tqdm(spec_df.iterrows(), total=len(spec_df), desc="Loading clusters"):
-        cid = row['cluster_id']
-        if cid not in cluster_dic:
-            cluster_dic[cid] = {}
-
-        # Deserialize spec_pool
-        spec_pool = []
-        for mz_bytes, int_bytes in zip(row['spec_pool_mz'], row['spec_pool_intensity']):
-            if len(mz_bytes) > 0 and len(int_bytes) > 0:
-                mz_arr = np.frombuffer(mz_bytes, dtype=np.float32)
-                int_arr = np.frombuffer(int_bytes, dtype=np.float32)
-                peaks = list(zip(mz_arr, int_arr))
-                spec_pool.append({"peaks": peaks})
-        cluster_dic[cid]["spec_pool"] = spec_pool
-
-        # Deserialize representative spectrum
-        spectrum = {}
-        if len(row['spectrum_mz']) > 0 and len(row['spectrum_intensity']) > 0:
-            mz_arr = np.frombuffer(row['spectrum_mz'], dtype=np.float32)
-            int_arr = np.frombuffer(row['spectrum_intensity'], dtype=np.float32)
-            spectrum['peaks'] = list(zip(mz_arr, int_arr))
-
-        spectrum.update({
-            'precursor_mz': float(row['precursor_mz']),
-            'rtinseconds': float(row['rtinseconds']),
-            'charge': int(row['charge']),
-            'title': row['title']
-        })
-        cluster_dic[cid]["spectrum"] = spectrum
+    # 2. Add spectra to existing clusters where available
+    cluster_path = os.path.join(in_dir, "spec_data.parquet")
+    if os.path.exists(cluster_path):
+        cluster_df = pq.read_table(cluster_path).to_pandas()
+        for row in cluster_df.itertuples():
+            if row.cluster_id in cluster_dic:
+                mz = np.frombuffer(row.spectrum_mz, dtype=np.float32)
+                intensity = np.frombuffer(row.spectrum_intensity, dtype=np.float32)
+                cluster_dic[row.cluster_id]['spectrum'] = {
+                    'peaks': list(zip(mz, intensity)),
+                    'precursor_mz': row.precursor_mz,
+                    'rtinseconds': row.rtinseconds,
+                    'charge': row.charge,
+                    'title': row.title
+                }
 
     return cluster_dic
 ##############################################################################
@@ -769,10 +580,8 @@ def cluster_one_folder(folder, checkpoint_dir, output_dir, tool_dir, precursor_t
     Then update cluster_dic.h5 and consensus.mzML in checkpoint_dir.
     """
 
-    cluster_dic_path = os.path.join(checkpoint_dir, "cluster_dic.h5")
     consensus_path   = os.path.join(checkpoint_dir, "consensus.mzML")
 
-    output_cluster_dic_path = os.path.join(output_dir, "cluster_dic.h5")
     output_consensus_path = os.path.join(output_dir, "consensus.mzML")
 
     scan_feather = os.path.join(checkpoint_dir, "scan_list.feather")
@@ -815,7 +624,7 @@ def cluster_one_folder(folder, checkpoint_dir, output_dir, tool_dir, precursor_t
     # print(f"[cluster_one_folder] Building mzML index for folder: {folder}")
     # indexer = create_mzml_indexer(folder)
     print(f"[cluster_one_folder] Building spectra dict for folder: {folder}")
-    folder_spec_dic = read_mzml_parallel(folder)
+    # folder_spec_dic = read_mzml_parallel(folder)
 
     mzml_end_time = time.time()
 
@@ -846,11 +655,11 @@ def cluster_one_folder(folder, checkpoint_dir, output_dir, tool_dir, precursor_t
     if has_checkpoint:
         # incremental
         print("[cluster_one_folder] Performing incremental clustering...")
-        cluster_dic = update_cluster_dic(cluster_dic, cluster_info_tsv, falcon_mgf_path, folder_spec_dic)
+        cluster_dic = update_cluster_dic(cluster_dic, cluster_info_tsv, falcon_mgf_path, folder)
     else:
         # initial
         print("[cluster_one_folder] Performing initial clustering...")
-        cluster_dic = initial_cluster_dic(cluster_info_tsv, falcon_mgf_path, folder_spec_dic)
+        cluster_dic = initial_cluster_dic(cluster_info_tsv, falcon_mgf_path, folder)
 
     update_cluster_end_time = time.time()
     print(f"Merge results took {update_cluster_end_time - sumarize_results_end_time:.2f} s.")
@@ -861,10 +670,10 @@ def cluster_one_folder(folder, checkpoint_dir, output_dir, tool_dir, precursor_t
 
 
     # Clean up local falcon outputs
-    if os.path.exists("falcon.csv"):
-        os.remove("falcon.csv")
-    if os.path.exists("falcon.mgf"):
-        os.remove("falcon.mgf")
+    # if os.path.exists("falcon.csv"):
+    #     os.remove("falcon.csv")
+    # if os.path.exists("falcon.mgf"):
+    #     os.remove("falcon.mgf")
     # if os.path.exists("output_summary"):
     #     shutil.rmtree("output_summary", ignore_errors=True)
 
@@ -892,23 +701,45 @@ def cluster_one_folder(folder, checkpoint_dir, output_dir, tool_dir, precursor_t
     # del cluster_dic, folder_spec_dic
     # gc.collect()
 
+# def finalize_results(cluster_dic, output_dir, current_batch_files=None):
+#     out_tsv = os.path.join(output_dir, "cluster_info.tsv")
+#     os.makedirs(output_dir, exist_ok=True)
+#
+#     fieldnames = ['precursor_mz','retention_time','cluster','filename','scan', 'new_batch']
+#     with open(out_tsv, 'w', newline='') as f:
+#         w = DictWriter(f, fieldnames=fieldnames, delimiter='\t')
+#         w.writeheader()
+#         for cid, cdata in cluster_dic.items():
+#             for item in cdata['scan_list']:
+#                 fn, sc, pmz, rt = item
+#                 is_new = 'yes' if current_batch_files and os.path.basename(fn) in current_batch_files else 'no'
+#                 row = {
+#                     'precursor_mz': pmz,
+#                     'retention_time': rt,
+#                     'cluster': cid,
+#                     'filename': fn,
+#                     'scan': sc,
+#                     'new_batch': is_new
+#                 }
+#                 w.writerow(row)
+#
+#     print(f"[finalize_results] Wrote final cluster_info.tsv: {out_tsv}")
+
 def finalize_results(cluster_dic, output_dir, current_batch_files=None):
     out_tsv = os.path.join(output_dir, "cluster_info.tsv")
     os.makedirs(output_dir, exist_ok=True)
 
-    fieldnames = ['precursor_mz','retention_time','cluster','filename','scan', 'new_batch']
+    fieldnames = ['cluster','filename','scan', 'new_batch']
     with open(out_tsv, 'w', newline='') as f:
         w = DictWriter(f, fieldnames=fieldnames, delimiter='\t')
         w.writeheader()
         for cid, cdata in cluster_dic.items():
             for item in cdata['scan_list']:
-                fn, sc, pmz, rt = item
+                fn, sc = item
                 is_new = 'yes' if current_batch_files and os.path.basename(fn) in current_batch_files else 'no'
                 row = {
-                    'precursor_mz': pmz,
-                    'retention_time': rt,
                     'cluster': cid,
-                    'filename': fn,
+                    'filename': os.path.basename(fn),
                     'scan': sc,
                     'new_batch': is_new
                 }
@@ -939,7 +770,7 @@ def main():
                        help="Minimum m/z range for clustering")
     parser.add_argument("--min_mz", type=float, default=0,
                        help="Minimum m/z value to consider")
-    parser.add_argument("--max_mz", type=float, default=30000,
+    parser.add_argument("--max_mz", type=float, default=4000,
                        help="Maximum m/z value to consider")
     parser.add_argument("--eps", type=float, default=0.1,
                        help="EPS parameter for DBSCAN clustering")
