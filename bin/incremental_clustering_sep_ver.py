@@ -129,6 +129,51 @@ def _read_mzml_file(filepath):
         print(f"Error reading {filepath}: {e}")
     return out
 
+def write_singletons_mzml(scan_list, output_path):
+    """Write an mzML file from a list of (fp, sc) with scan IDs as {filename}_{scan}."""
+    temp_dir = Path(output_path).parent / "temp_singletons"
+    temp_dir.mkdir(exist_ok=True)
+    fetch_write = defaultdict(list)
+    path_map = {}
+
+    for fp, sc in scan_list:
+        # Create unique path fingerprint (8 char hash + basename)
+        path_hash = hashlib.md5(str(fp).encode()).hexdigest()[:8]
+        base_name = Path(fp).stem
+        path_key = f"{path_hash}_{base_name}"
+        path_map[path_key] = fp  # Maintain path lookup
+
+        new_id = f"{path_key}_{sc}"
+        fetch_write[fp].append((sc, new_id))
+
+    # Write path mapping for downstream processing
+    map_file = Path(output_path).with_suffix(".pathmap.feather")
+    path_df = pd.DataFrame.from_dict(path_map, orient='index', columns=["full_path"])
+    feather.write_feather(path_df, map_file)
+
+    tasks = []
+    for fp, scans in fetch_write.items():
+        if Path(fp).exists():
+            tasks.append((fp, scans, temp_dir))
+        else:
+            print(f"File not found: {fp}")
+
+    with Pool(processes=min(16, os.cpu_count())) as pool:
+        temp_files = pool.starmap(_process_fetch_file, tasks)
+
+    exp_final = oms.MSExperiment()
+    for temp_file in temp_files:
+        if temp_file and Path(temp_file).exists():
+            temp_exp = oms.MSExperiment()
+            oms.MzMLFile().load(str(temp_file), temp_exp)
+            for spec in temp_exp.getSpectra():
+                exp_final.addSpectrum(spec)
+            Path(temp_file).unlink()
+
+    oms.MzMLFile().store(output_path, exp_final)
+    shutil.rmtree(temp_dir, ignore_errors=True)
+    return exp_final.size()
+
 def write_mzml(cluster_dic, out_path):
 
     ref_write = {} #cid:spectrum data
@@ -340,15 +385,9 @@ def read_mgf(filename):
 ##############################################################################
 
 def initial_cluster_dic(cluster_info_tsv, falcon_mgf, original_file_path):
-    """
-    Create a cluster_dic from scratch, handling cluster IDs:
-    - Non-`-1` clusters retain their original IDs.
-    - `-1` clusters get new sequential IDs.
-    """
     cluster_dic = {}
-    current_max_id = 0  # Track the highest cluster ID
+    singletons = []
 
-    # Split rows into non-neg and neg clusters
     non_neg_rows = []
     neg_rows = []
     with open(cluster_info_tsv, 'r') as csvfile:
@@ -357,130 +396,114 @@ def initial_cluster_dic(cluster_info_tsv, falcon_mgf, original_file_path):
             cid = int(row['cluster'])
             if cid != -1:
                 non_neg_rows.append(row)
-                current_max_id = max(current_max_id, cid)  # Track max ID
             else:
                 neg_rows.append(row)
 
-    # Process non-neg clusters (original IDs)
+    # Process non-neg clusters
+    current_max_id = 0
     for row in non_neg_rows:
         cid = int(row['cluster'])
+        current_max_id = max(current_max_id, cid)
         fn = row['filename']
         sc = int(row['scan'])
-        # pmz = row['precursor_mz']
-        # rt = row['retention_time']
-        fp = get_original_file_path(fn,original_file_path)
-
-
+        fp = get_original_file_path(fn, original_file_path)
         if cid not in cluster_dic:
-            cluster_dic[cid] = {'scan_list': [], 'spec_pool': []}
+            cluster_dic[cid] = {'scan_list': []}
         cluster_dic[cid]['scan_list'].append((fp, sc))
 
-    # Process neg clusters (assign new IDs sequentially)
+    # Process neg clusters (singletons)
     for row in neg_rows:
-        current_max_id += 1
-        new_cid = current_max_id
         fn = row['filename']
         sc = int(row['scan'])
-        # pmz = row['precursor_mz']
-        # rt = row['retention_time']
         fp = get_original_file_path(fn, original_file_path)
+        singletons.append((fp, sc))
 
-        cluster_dic[new_cid] = {
-            'scan_list': [(fp, sc)],
-            'spec_pool': [],
-        }
-
-    # Attach Falcon MGF reps (use original IDs directly)
+    # Attach Falcon MGF reps
     mgf_spectra = read_mgf(falcon_mgf)
     for spectrum in mgf_spectra:
         original_cid = int(spectrum['cluster'])
         if original_cid in cluster_dic:
             cluster_dic[original_cid]['spectrum'] = spectrum
-        else:
-            print(f"Cluster {original_cid} not found, skipping.")
 
-    return cluster_dic
+    return cluster_dic, singletons
 
-def update_cluster_dic(cluster_dic, cluster_info_tsv, falcon_mgf, original_file_path):
+def update_cluster_dic(cluster_dic, cluster_info_tsv, falcon_mgf, original_file_path,path_map=None):
     """
-    Merge newly generated cluster_info into existing cluster_dic
-    (i.e., "incremental" approach).
+    Merge new clustering results into existing cluster_dic, returning:
+    - Updated cluster_dic (only non-singletons)
+    - List of new singletons (filepath, scan) tuples
     """
-    currentID_uniID = {}
-    cat_consensus = []
-    cat_noncons_nonneg = []
-    cat_neg = []
+    currentID_uniID = {}  # Mapping from Falcon's temporary IDs to unified cluster IDs
+    new_singletons = []  # Stores (filepath, scan) of new singletons
+    new_cluster_id = max(cluster_dic.keys(), default=0)
+
+    # Categorize rows from cluster_info.tsv
+    consensus_rows = []
+    nonconsensus_rows = []
 
     with open(cluster_info_tsv, 'r') as csvfile:
         rdr = csv.DictReader(csvfile, delimiter='\t')
         for row in rdr:
             cid = int(row['cluster'])
-            fn  = row['filename']
-            if fn == "consensus.mzML":
-                cat_consensus.append(row)
+            if row['filename'] == "consensus.mzML":
+                consensus_rows.append(row)
             elif cid != -1:
-                cat_noncons_nonneg.append(row)
+                nonconsensus_rows.append(row)
             else:
-                cat_neg.append(row)
+                # Collect singletons directly
+                # Resolve singleton paths using path_map
+                if '_' in row['scan'] and path_map is not None:  # Format: HASH_basename_scan
+                    path_part = '_'.join(row['scan'].split('_')[:-1])
+                    try:
+                        fp = path_map.loc[path_part, "full_path"]
+                        sc = int(row['scan'].split('_')[-1])
+                        new_singletons.append((fp, sc))
+                    except KeyError:
+                        print(f"Path mapping missing for {path_part}")
+                else:  # New singletons from current batch
+                    fp = get_original_file_path(row['filename'], original_file_path)
+                    new_singletons.append((fp, int(row['scan'])))
 
-    # 1) consensus
-    for row in cat_consensus:
+
+    # Process consensus spectra (from previous batches)
+    for row in consensus_rows:
         cid = int(row['cluster'])
-        sc  = row['scan'].split('_')[0]
-        if sc.isdigit():
-            sc = int(sc)
+        scan_parts = row['scan'].split('_')
+        sc = int(scan_parts[0]) if scan_parts else 0
+
         if cid not in currentID_uniID:
             currentID_uniID[cid] = sc
 
-    # 2) non-consensus, non-neg
-    new_key = max(cluster_dic.keys(), default=0)
-    for row in tqdm(cat_noncons_nonneg):
+    # Process non-consensus non-singleton clusters
+    for row in tqdm(nonconsensus_rows, desc="Merging non-singletons"):
         cid = int(row['cluster'])
         fn = row['filename']
         sc = int(row['scan'])
-        # pmz= row['precursor_mz']
-        # rt = row['retention_time']
         fp = get_original_file_path(fn, original_file_path)
 
-        # try:
-        #     sp_data = indexer.get_spectrum(base, sc)
-        # except Exception as e:
-        #     print("error fetching spectrum", base, sc)
-
+        # Get or create unified cluster ID
         if cid not in currentID_uniID:
-            new_key += 1
-            currentID_uniID[cid] = new_key
-            cluster_dic[new_key] = {'scan_list':[], 'spec_pool':[]}
+            new_cluster_id += 1
+            currentID_uniID[cid] = new_cluster_id
+            cluster_dic[new_cluster_id] = {'scan_list':[], 'spec_pool':[]}
         mapped_cid = currentID_uniID[cid]
         cluster_dic[mapped_cid]['scan_list'].append((fp, sc))
 
-
-    # 3) cluster_id = -1
-    new_cluster_id = max(cluster_dic.keys(), default=0)
-    for row in tqdm(cat_neg):
-        fn = row['filename']
-        sc = int(row['scan'])
-        # pmz= row['precursor_mz']
-        # rt = row['retention_time']
-        fp = get_original_file_path(fn, original_file_path)
-
-        new_cluster_id += 1
-        currentID_uniID[new_cluster_id] = new_cluster_id
-        cluster_dic[new_cluster_id] = {'scan_list':[], 'spec_pool':[]}
-        cluster_dic[new_cluster_id]['scan_list'].append((fp, sc))
-
-    # attach falcon mgf reps
+    # Attach Falcon MGF representatives (skip singletons)
     mgf_spectra = read_mgf(falcon_mgf)
-    for s in mgf_spectra:
+    for spectrum in mgf_spectra:
         try:
-            old_cid = int(s['cluster'])
-            if old_cid in currentID_uniID:
-                new_cid = currentID_uniID[old_cid]
-                cluster_dic[new_cid]['spectrum'] = s
-        except KeyError:
-            print(old_cid, s['title'])
+            old_cid = int(spectrum.get('cluster', -1))
+            if old_cid == -1:
+                continue  # Skip singleton representatives
 
-    return cluster_dic
+            if old_cid in currentID_uniID:
+                unified_cid = currentID_uniID[old_cid]
+                cluster_dic[unified_cid]['spectrum'] = spectrum
+        except (ValueError, KeyError):
+            continue
+
+    return cluster_dic, new_singletons
 
 
 def save_cluster_dic_optimized(cluster_dic, out_dir):
@@ -587,87 +610,104 @@ def cluster_one_folder(folder, checkpoint_dir, output_dir, tool_dir, precursor_t
     scan_feather = os.path.join(checkpoint_dir, "scan_list.feather")
     spec_parquet = os.path.join(checkpoint_dir, "spec_data.parquet")
 
-
-
-    if os.path.exists(consensus_path):
-        # Include the consensus file along with the new mzML files.
-        input_files = f"{folder}/*.mzML {consensus_path}"
-        print(f"[cluster_one_folder] Consensus file found; adding {consensus_path} to Falcon input.")
-    else:
-        input_files = f"{folder}/*.mzML"
-        print(f"[cluster_one_folder] No consensus file found; proceeding with folder mzML files only.")
-
-    current_batch_files = set()
-    for fname in os.listdir(folder):
-        if fname.endswith('.mzML') and fname != 'consensus.mzML':
-            current_batch_files.add(fname)  # Store base name, not full path
+    has_checkpoint = os.path.exists(scan_feather) and os.path.exists(spec_parquet)
 
     start_time = time.time()
 
-    # 1) RUN FALCON on the folder's *.mzML
-    run_falcon(
-        input_files,
-        "falcon",
-        precursor_tol=precursor_tol,
-        fragment_tol=fragment_tol,
-        min_mz_range=min_mz_range,
-        min_mz=min_mz,
-        max_mz=max_mz,
-        eps=eps
-    )
+    if not has_checkpoint:
+        #run falcon
+        print("[Initial] Running Falcon on all new spectra...")
+        input_files = f"{folder}/*.mzML"
+        run_falcon(input_files, "falcon", precursor_tol, fragment_tol, min_mz_range, min_mz, max_mz, eps)
+        falcon_end_time = time.time()
+        print(f"Falcon clustering took {falcon_end_time - start_time:.2f} s.")
 
-    falcon_end_time = time.time()
+        #summarize results
+        cluster_info_tsv = summarize_output(output_dir, os.path.join(tool_dir, 'summarize_results.py'), 'falcon.csv')
+        summarize_time = time.time()
+        print(f"Summarize falcon results took {summarize_time - falcon_end_time:.2f} s.")
 
-    print(f"Falcon clustering took {falcon_end_time- start_time:.2f} s.")
-
-    # Build a dictionary of the spectra in this folder
-    # print(f"[cluster_one_folder] Building mzML index for folder: {folder}")
-    # indexer = create_mzml_indexer(folder)
-    print(f"[cluster_one_folder] Building spectra dict for folder: {folder}")
-    # folder_spec_dic = read_mzml_parallel(folder)
-
-    mzml_end_time = time.time()
-
-    print(f"Reading files took {mzml_end_time - falcon_end_time:.2f} s.")
-
-    # Read existing cluster_dic (if any)
-
-    has_checkpoint = os.path.exists(scan_feather) and os.path.exists(spec_parquet)
-
-    if has_checkpoint:
-        cluster_dic = load_cluster_dic_optimized(checkpoint_dir)
-    else:
-        cluster_dic = {}  # Start fresh
-
-    cluster_dic_load_time = time.time()
-
-    print(f"Loading clustering dic took {cluster_dic_load_time - mzml_end_time:.2f} s.")
-
-    # 2) Summarize => we get cluster_info.tsv
-    cluster_info_tsv = summarize_output(output_dir,summarize_script= os.path.join(tool_dir,"summarize_results.py"), falcon_csv="falcon.csv")
-
-    sumarize_results_end_time = time.time()
-    print(f"sumarize results took {sumarize_results_end_time - cluster_dic_load_time:.2f} s.")
-
-    # 3) Merge or Initialize cluster_dic
-    falcon_mgf_path = os.path.join(os.getcwd(), "falcon.mgf")
-
-    if has_checkpoint:
-        # incremental
-        print("[cluster_one_folder] Performing incremental clustering...")
-        cluster_dic = update_cluster_dic(cluster_dic, cluster_info_tsv, falcon_mgf_path, folder)
-    else:
-        # initial
+        #initialize cluster dic
+        falcon_mgf_path = os.path.join(os.getcwd(), "falcon.mgf")
         print("[cluster_one_folder] Performing initial clustering...")
-        cluster_dic = initial_cluster_dic(cluster_info_tsv, falcon_mgf_path, folder)
+        cluster_dic,singletons = initial_cluster_dic(cluster_info_tsv, falcon_mgf_path, folder)
+        cluster_dic_time = time.time()
+        print(f"Cluster dic initialize took {cluster_dic_time - summarize_time:.2f} s.")
 
-    update_cluster_end_time = time.time()
-    print(f"Merge results took {update_cluster_end_time - sumarize_results_end_time:.2f} s.")
-    # del folder_spec_dic  # Explicitly delete the dictionary
-    # gc.collect()  # Force garbage collection
+        #write consensus mzML file
+        n_written = write_mzml(cluster_dic, output_consensus_path)
+        consensus_end_time = time.time()
+        print(f"Write consensus mzML file took {consensus_end_time - cluster_dic_time:.2f} s.")
 
-    #indexer.close()
+        #write singletons
+        singletons_mzml_path = os.path.join(output_dir, "singletons.mzML")
+        write_singletons_mzml(singletons, singletons_mzml_path)
+    else:
+        # Incremental processing
+        # First Falcon run: new data + consensus
+        print("[Incremental] Phase 1: non-singleton clustering...")
+        input_files = f"{folder}/*.mzML {consensus_path}"
+        run_falcon(input_files, "falcon1", precursor_tol, fragment_tol, min_mz_range, min_mz, max_mz, eps)
+        falcon1_end_time = time.time()
+        print(f"Falcon phase 1 clustering took {falcon1_end_time - start_time:.2f} s.")
 
+        #summarize phase1 results
+        cluster_info1_tsv = summarize_output(output_dir, os.path.join(tool_dir, 'summarize_results.py'), falcon_csv="falcon1.csv")
+        summarize1_time = time.time()
+        print(f"Summarize falcon phase 1 results took {summarize1_time - falcon1_end_time:.2f} s.")
+
+        #load cluster dic time
+        cluster_dic = load_cluster_dic_optimized(checkpoint_dir)
+        load_cluster_dic_time = time.time()
+        print(f"Load cluster dic took {load_cluster_dic_time - summarize1_time:.2f} s.")
+
+        #Update cluster dic phase 1
+        cluster_dic, new_singletons1 = update_cluster_dic(cluster_dic, cluster_info1_tsv, "falcon1.mgf", folder)
+        update1_cluster_dic_time = time.time()
+        print(f"Update cluster dic phase1 took {update1_cluster_dic_time - load_cluster_dic_time:.2f} s.")
+
+        #write phase1 singletons
+        temp_singletons_path = os.path.join(output_dir, "temp_singletons.mzML")
+        write_singletons_mzml(new_singletons1, temp_singletons_path)
+        write_singletons1_end_time = time.time()
+        print(f"Write phase 1 singletons took {write_singletons1_end_time - update1_cluster_dic_time:.2f} s.")
+
+        # Second Falcon run: existing singletons + new temp_singletons
+        singletons_mzml_path = os.path.join(checkpoint_dir, "singletons.mzML")
+        run_falcon(f"{singletons_mzml_path} {temp_singletons_path}", "falcon2", precursor_tol, fragment_tol, min_mz_range, min_mz, max_mz, eps)
+        falcon2_end_time = time.time()
+        print(f"Falcon phase 2 took {falcon2_end_time - write_singletons1_end_time:.2f} s.")
+
+        #summarize phase2 results
+        cluster_info2_tsv = summarize_output(output_dir, os.path.join(tool_dir, 'summarize_results.py'), falcon_csv="falcon2.csv")
+        summarize2_time = time.time()
+        print(f"Summarize falcon phase 2 results took {summarize2_time - falcon2_end_time:.2f} s.")
+
+        #update cluster dic phase 2
+        # Load both path maps
+        existing_map_path = Path(singletons_mzml_path).with_suffix(".pathmap.feather")
+        temp_map_path = Path(temp_singletons_path).with_suffix(".pathmap.feather")
+        # Handle missing maps gracefully
+        path_maps = []
+        if existing_map_path.exists():
+            path_maps.append(feather.read_feather(existing_map_path))
+        if temp_map_path.exists():
+            path_maps.append(feather.read_feather(temp_map_path))
+        # Combine maps if both exist
+        combined_map = pd.concat(path_maps).drop_duplicates() if path_maps else None
+        cluster_dic, new_singletons2 = update_cluster_dic(cluster_dic, cluster_info2_tsv, "falcon2.mgf", folder,combined_map)
+        update2_cluster_dic_time = time.time()
+        print(f"Update cluster dic phase2 took {update2_cluster_dic_time - summarize2_time:.2f} s.")
+
+        #wirte final consensus results
+        n_written = write_mzml(cluster_dic, output_consensus_path)
+        consensus_end_time = time.time()
+        print(f"Write consensus mzML file took {consensus_end_time - update2_cluster_dic_time:.2f} s.")
+
+        #write phase2 singletons
+        write_singletons_mzml(new_singletons2, singletons_mzml_path)
+        write_singletons2_end_time = time.time()
+        print(f"Write phase2 singletons took {write_singletons2_end_time - consensus_end_time:.2f} s.")
 
     # Clean up local falcon outputs
     # if os.path.exists("falcon.csv"):
@@ -677,29 +717,21 @@ def cluster_one_folder(folder, checkpoint_dir, output_dir, tool_dir, precursor_t
     # if os.path.exists("output_summary"):
     #     shutil.rmtree("output_summary", ignore_errors=True)
 
-    # 4) Write updated consensus
-    n_written = write_mzml(cluster_dic, output_consensus_path)
-    print(f"[cluster_one_folder] Wrote {n_written} spectra to consensus: {output_consensus_path}")
-
-    consensus_write_end_time = time.time()
-    print(f"consensus mzML writing took {consensus_write_end_time - update_cluster_end_time:.2f} s.")
-
-
-    # 5) Save updated cluster_dic
+    #save updated cluster_dic
+    cluster_end_time = time.time()
     save_cluster_dic_optimized(cluster_dic, output_dir)
     print(f"[cluster_one_folder] Updated cluster_dic saved at {output_dir}")
-
     save_cluster_dic_end_time = time.time()
-    print(f"Save cluster dic took {save_cluster_dic_end_time - consensus_write_end_time:.2f} s.")
+    print(f"Save cluster dic took {save_cluster_dic_end_time - cluster_end_time:.2f} s.")
 
-
+    #final results output
+    current_batch_files = set()
+    for fname in os.listdir(folder):
+        if fname.endswith('.mzML') and fname != 'consensus.mzML':
+            current_batch_files.add(fname)  # Store base name, not full path
     finalize_results(cluster_dic, output_dir, current_batch_files)
     output_results_end_time = time.time()
     print(f"Output results took {output_results_end_time - save_cluster_dic_end_time:.2f} s.")
-
-    # optional memory cleanup
-    # del cluster_dic, folder_spec_dic
-    # gc.collect()
 
 # def finalize_results(cluster_dic, output_dir, current_batch_files=None):
 #     out_tsv = os.path.join(output_dir, "cluster_info.tsv")
