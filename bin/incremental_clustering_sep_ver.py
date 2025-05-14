@@ -478,8 +478,24 @@ def update_cluster_dic(cluster_dic, cluster_info_tsv, falcon_mgf, original_file_
     for row in tqdm(nonconsensus_rows, desc="Merging non-singletons"):
         cid = int(row['cluster'])
         fn = row['filename']
-        sc = int(row['scan'])
-        fp = get_original_file_path(fn, original_file_path)
+        scan_str = row['scan']
+        if '_' in scan_str and path_map is not None:
+            try:
+                # Split composite ID: "b5d82eac_H11-2_3083" -> ("b5d82eac_H11-2", 3083)
+                path_part, sc = scan_str.rsplit('_', 1)
+                sc = int(sc)
+                fp = path_map.loc[path_part, "full_path"]
+            except (ValueError, KeyError) as e:
+                print(f"Invalid composite scan {scan_str}: {e}")
+                continue
+        else:
+            # Handle normal integer scans from raw files
+            try:
+                sc = int(scan_str)
+                fp = get_original_file_path(fn, original_file_path)
+            except ValueError:
+                print(f"Invalid scan value {scan_str} in file {fn}")
+                continue
 
         # Get or create unified cluster ID
         if cid not in currentID_uniID:
@@ -705,7 +721,8 @@ def cluster_one_folder(folder, checkpoint_dir, output_dir, tool_dir, precursor_t
         print(f"Write consensus mzML file took {consensus_end_time - update2_cluster_dic_time:.2f} s.")
 
         #write phase2 singletons
-        write_singletons_mzml(new_singletons2, singletons_mzml_path)
+        singletons2_mzml_path = os.path.join(output_dir, "singletons.mzML")
+        write_singletons_mzml(new_singletons2, singletons2_mzml_path)
         write_singletons2_end_time = time.time()
         print(f"Write phase2 singletons took {write_singletons2_end_time - consensus_end_time:.2f} s.")
 
