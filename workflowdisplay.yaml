@@ -29,7 +29,7 @@ Views:
             column: "cluster"
         };
         return `
-            <a target="_blank" href="https://metabolomics-usi.gnps2.org/dashinterface/?usi1=mzspec:GNPS2:TASK-${ task }-results/consensus.mzML:scan:${ row[ "cluster" ] }">View Spectrum</a>
+            <a target="_blank" href="https://metabolomics-usi.gnps2.org/dashinterface/?usi1=mzspec:GNPS2:TASK-${ task }-nf_output/results/consensus.mzML:scan:${ row[ "cluster" ] }">View Spectrum</a>
         `; } }]'
 
 -   name: section
