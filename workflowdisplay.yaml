@@ -6,7 +6,7 @@ Views:
     viewname: outputlist
     displaytype: datatable_serverbig
     parameters:
-        filename: results/cluster_info.tsv
+        filename: nf_output/results/cluster_info.tsv
         columns:
             -   title: "View"
                 data:
@@ -46,7 +46,7 @@ Views:
         urlparam:
             -   workflowname:incremental_clustering_nextflow_workflow
         hashparam:
-            -   checkpoint_dir:TASKLOCATION/[task]/results/
+            -   checkpoint_dir:TASKLOCATION/[task]/nf_output/results/
 
 -   name: Downstream Analysis - Network Barebone
     displayname: Downstream Analysis - Run Network Barebone
@@ -57,5 +57,5 @@ Views:
         urlparam:
             -   workflowname:networking_barebone_workflow
         hashparam:
-            -   inputspectra:TASKLOCATION/[task]/results/consensus.mzML
+            -   inputspectra:TASKLOCATION/[task]/nf_output/results/consensus.mzML
 
