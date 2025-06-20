@@ -325,11 +325,11 @@ def read_mgf(filename):
 def initial_cluster_dic(cluster_info_tsv, falcon_mgf, spectra_dic):
     """
     Create a cluster_dic from scratch, handling cluster IDs:
-    - Non-`-1` clusters retain their original IDs.
-    - `-1` clusters get new sequential IDs.
+    - Non-`-1` clusters get their original IDs + 1.
+    - `-1` clusters get new sequential IDs starting after the max cluster.
     """
     cluster_dic = {}
-    current_max_id = 0  # Track the highest cluster ID
+    current_max_id = 0  # Track the highest cluster ID from falcon (which starts at 0)
 
     # Split rows into non-neg and neg clusters
     non_neg_rows = []
@@ -340,37 +340,36 @@ def initial_cluster_dic(cluster_info_tsv, falcon_mgf, spectra_dic):
             cid = int(row['cluster'])
             if cid != -1:
                 non_neg_rows.append(row)
-                current_max_id = max(current_max_id, cid)  # Track max ID
+                current_max_id = max(current_max_id, cid)  # Track max ORIGINAL ID
             else:
                 neg_rows.append(row)
 
-    # Process non-neg clusters (original IDs)
+    # Process non-neg clusters (original IDs + 1)
     for row in non_neg_rows:
-        cid = int(row['cluster'])
+        cid = int(row['cluster']) + 1  # Shift ID by +1
         fn = row['filename']
         sc = int(row['scan'])
         pmz = row['precursor_mz']
         rt = row['retention_time']
         base = os.path.splitext(os.path.basename(fn))[0]
-        #sp_data = indexer.get_spectrum(base, sc)
-        sp_data = spectra_dic[(base,sc)]
-
+        sp_data = spectra_dic[(base, sc)]
 
         if cid not in cluster_dic:
             cluster_dic[cid] = {'scan_list': [], 'spec_pool': []}
         cluster_dic[cid]['scan_list'].append((fn, sc, pmz, rt))
         cluster_dic[cid]['spec_pool'].append(sp_data)
 
-    # Process neg clusters (assign new IDs sequentially)
+    # Process neg clusters (assign new IDs sequentially after shifted max)
+    # The new max ID is current_max_id + 1. The next available ID is current_max_id + 2.
+    new_cluster_start_id = current_max_id + 1
     for row in neg_rows:
-        current_max_id += 1
-        new_cid = current_max_id
+        new_cluster_start_id += 1
+        new_cid = new_cluster_start_id
         fn = row['filename']
         sc = int(row['scan'])
         pmz = row['precursor_mz']
         rt = row['retention_time']
         base = os.path.splitext(os.path.basename(fn))[0]
-        # sp_data = indexer.get_spectrum(base, sc)
         sp_data = spectra_dic[(base, sc)]
 
         cluster_dic[new_cid] = {
@@ -379,15 +378,17 @@ def initial_cluster_dic(cluster_info_tsv, falcon_mgf, spectra_dic):
             'spectrum': sp_data  # Initial representative
         }
 
-    # Attach Falcon MGF reps (use original IDs directly)
+    # Attach Falcon MGF reps (use original IDs + 1)
     mgf_spectra = read_mgf(falcon_mgf)
     for spectrum in mgf_spectra:
+        # MGF only contains non -1 clusters
         original_cid = int(spectrum['cluster'])
-        if original_cid in cluster_dic:
-            cluster_dic[original_cid]['spectrum'] = spectrum
-            cluster_dic[original_cid]['title'] = spectrum['title']
+        new_cid = original_cid + 1  # Shift ID by +1
+        if new_cid in cluster_dic:
+            cluster_dic[new_cid]['spectrum'] = spectrum
+            cluster_dic[new_cid]['title'] = spectrum['title']
         else:
-            print(f"Cluster {original_cid} not found, skipping.")
+            print(f"Cluster {new_cid} (original: {original_cid}) not found, skipping MGF attachment.")
 
     return cluster_dic
 
