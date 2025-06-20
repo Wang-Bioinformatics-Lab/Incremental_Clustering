@@ -5,7 +5,7 @@ channels:
 channel_priority: strict
 dependencies:
   - python=3.10
-  - pandas=2.2.0
+  - pandas=1.5.0
   - pyteomics=4.7.1
   - pip:
     - numpy==1.23.4
