@@ -1,7 +1,7 @@
 workflowname: incremental_clustering_nextflow_workflow
 workflowdescription: incremental_clustering_nextflow_workflow
 workflowlongdescription: This is the incremental_clustering_nextflow_workflow
-workflowversion: "6.20.2025.v4"
+workflowversion: "6.20.2025.v5"
 workflowfile: nf_workflow.nf
 workflowautohide: false
 adminonly: false
@@ -47,14 +47,14 @@ parameterlist:
       formvalue: "0.05"
       tooltip: "fragment_tolerance"
 
-    - displayname: Min Peak Intensity
+    - displayname: Min Peak m/z
       paramtype: text
       nf_paramname: min_mz
       formplaceholder: Enter the min_mz
       formvalue: "0"
       tooltip: "min_mz"
 
-    - displayname: Max Peak Intensity
+    - displayname: Max Peak m/z
       paramtype: text
       nf_paramname: max_mz
       formplaceholder: Enter the max_mz
