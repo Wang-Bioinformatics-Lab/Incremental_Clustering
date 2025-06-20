@@ -4,7 +4,8 @@ nextflow.enable.dsl=2
 params.input_spectra = "/home/user/research/Incremental_Clustering/data"
 
 //This publish dir is mostly  useful when we want to import modules in other workflows, keep it here usually don't change it
-params.publishdir = "$baseDir/nf_output"
+
+params.publishdir = "$launchDir"
 TOOL_FOLDER = "$baseDir/bin"
 params.output_dir = "$baseDir/results"
 params.checkpoint_dir  = "$baseDir/checkpoint"
@@ -17,11 +18,22 @@ params.min_mz = 0
 params.max_mz = 30000
 params.eps = 0.1
 
+// COMPATIBILITY NOTE: The following might be necessary if this workflow is being deployed in a slightly different environemnt
+// checking if outdir is defined,
+// if so, then set publishdir to outdir
+if (params.outdir) {
+    _publishdir = params.outdir
+}
+else{
+    _publishdir = params.publishdir
+}
 
+// Augmenting with nf_output
+_publishdir = "${_publishdir}/nf_output"
 
 
 process CLUSTERING {
-    publishDir "$params.publishdir", mode: 'copy'
+    publishDir "$_publishdir", mode: 'copy'
     conda "$baseDir/bin/conda_env.yml"
 
     input:
