@@ -45,11 +45,14 @@ process CLUSTERING {
     file "results/*csv" optional true
     file "results/*feather" optional true
     file "results/*parquet" optional true
+    file "results/*txt" optional true
+    file "results/spectrum_storage/*db" optional true
+    file "results/spectrum_storage/*bin" optional true
 
     script:
     """
     mkdir results
-    python3 $TOOL_FOLDER/incremental_clustering.py \
+    python3 $TOOL_FOLDER/incremental_clustering_sep_ver.py \
         --folder $input \
         --checkpoint_dir "${params.checkpoint_dir}" \
         --output_dir results \

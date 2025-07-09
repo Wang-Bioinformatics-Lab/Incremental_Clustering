@@ -1,7 +1,7 @@
 workflowname: incremental_clustering_nextflow_workflow
 workflowdescription: incremental_clustering_nextflow_workflow
 workflowlongdescription: This is the incremental_clustering_nextflow_workflow
-workflowversion: "6.20.2025.v7"
+workflowversion: "7.09.2025.v1"
 workflowfile: nf_workflow.nf
 workflowautohide: false
 adminonly: false
