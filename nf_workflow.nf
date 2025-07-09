@@ -46,8 +46,8 @@ process CLUSTERING {
     file "results/*feather" optional true
     file "results/*parquet" optional true
     file "results/*txt" optional true
-    file "results/spectrum_storage/*db" optional true
-    file "results/spectrum_storage/*bin" optional true
+    file "results/*db" optional true
+    file "results/*bin" optional true
 
     script:
     """
