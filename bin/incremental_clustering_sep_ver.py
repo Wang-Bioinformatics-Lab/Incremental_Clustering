@@ -157,7 +157,7 @@ class SpectrumStorage:
             conn.commit()
     
     def store_spectra_batch(self, spectra_data: list):
-        """Store multiple spectra efficiently with incremental update support"""
+        """Store multiple spectra efficiently with incremental update support (no deduplication)"""
         if not spectra_data:
             return
         
@@ -171,44 +171,14 @@ class SpectrumStorage:
         for batch_start in range(0, total_spectra, batch_size):
             batch_end = min(batch_start + batch_size, total_spectra)
             batch_data = spectra_data[batch_start:batch_end]
-            
             print(f"[store_spectra_batch] Processing batch {batch_start//batch_size + 1}/{(total_spectra + batch_size - 1)//batch_size} ({len(batch_data)} spectra)")
             
-            # Check for existing spectra in this batch
-            existing_keys = set()
-            with sqlite3.connect(self.index_db) as conn:
-                # Build batch query for this batch only
-                conditions = []
-                query_params = []
-                for spec in batch_data:
-                    conditions.append("(filename = ? AND scan = ?)")
-                    query_params.extend([str(spec['filename']), int(spec['scan'])])
-                
-                where_clause = " OR ".join(conditions)
-                cursor = conn.execute(f"""
-                    SELECT filename, scan FROM spectrum_index 
-                    WHERE {where_clause}
-                """, query_params)
-                
-                for row in cursor.fetchall():
-                    existing_keys.add((row[0], row[1]))
-            
-            # Filter out existing spectra
-            new_spectra = [spec for spec in batch_data 
-                          if (spec['filename'], spec['scan']) not in existing_keys]
-            
-            if not new_spectra:
-                print(f"[store_spectra_batch] All {len(batch_data)} spectra in batch already exist, skipping")
-                continue
-            
-            print(f"[store_spectra_batch] Adding {len(new_spectra)} new spectra out of {len(batch_data)} in batch")
-            
-            # Prepare data for new spectra only
+            # Prepare data for all spectra in this batch
             index_data = []
             binary_data = b''
             spectrum_sizes = []
             
-            for spec in new_spectra:
+            for spec in batch_data:
                 filename = spec['filename']
                 scan = spec['scan']
                 spectrum = {
@@ -217,7 +187,6 @@ class SpectrumStorage:
                     'rtinseconds': spec.get('rtinseconds', 0.0),
                     'charge': spec.get('charge', 0)
                 }
-                
                 # Pack spectrum
                 spectrum_data = self._pack_spectrum(spectrum)
                 binary_data += spectrum_data
@@ -235,8 +204,8 @@ class SpectrumStorage:
                 offsets.append(current_offset)
                 current_offset += size
             
-            # Write index data
-            for i, spec in enumerate(new_spectra):
+            # Prepare index data for all spectra
+            for i, spec in enumerate(batch_data):
                 index_data.append((
                     str(spec['filename']), int(spec['scan']), offsets[i], spectrum_sizes[i],
                     spec.get('precursor_mz', 0.0),
@@ -245,6 +214,7 @@ class SpectrumStorage:
                     len(spec.get('peaks', []))
                 ))
             
+            # Directly insert all, let SQLite handle deduplication
             with sqlite3.connect(self.index_db) as conn:
                 conn.executemany("""
                     INSERT OR REPLACE INTO spectrum_index 
@@ -1305,9 +1275,8 @@ def save_cluster_dic_optimized(cluster_dic, out_dir, singletons=None, singletons
     if sample_data:
         sample_table = pa.Table.from_pylist(sample_data)
         feather.write_feather(sample_table, os.path.join(out_dir, "sample_list.feather"))
-    # Save consensus (cluster representative spectra)
-    consensus_parquet_path = os.path.join(out_dir, "consensus.parquet")
-    save_consensus_incremental(cluster_dic, consensus_parquet_path)
+    # Consensus spectra are saved separately in cluster_one_folder
+    # to avoid duplicate saving
     # Initialize efficient storage - use output directory directly, don't create subfolder
     get_spectrum_storage(out_dir)
     print(f"[save_cluster_dic_optimized] Saved {len(scan_data)} scan_list entries and {len(sample_data)} sample_list entries (no spectrum bodies)")
@@ -1317,10 +1286,12 @@ def load_cluster_dic_optimized(in_dir):
     Only load scan_list and sample_list, spectrum bodies are no longer redundantly loaded from disk.
     When spectrum is needed, dynamically look it up through consensus.parquet or efficient storage system.
     Automatically supplement consensus spectrum for each cluster during loading (if available).
+    Returns: (cluster_dic, max_cluster_id)
     """
     cluster_dic = {}
+    max_cluster_id = 0
     if not os.path.exists(in_dir):
-        return cluster_dic
+        return cluster_dic, max_cluster_id
     # Load scan_list
     scan_path = os.path.join(in_dir, "scan_list.feather")
     if os.path.exists(scan_path):
@@ -1346,11 +1317,12 @@ def load_cluster_dic_optimized(in_dir):
                 else:
                     # Legacy format - use default values
                     cluster_dic[row.cluster_id]['sample_list'].append((row.filename, row.scan, 0.0, 0.0))
-    # Automatically supplement consensus spectrum
+    # Automatically supplement consensus spectrum and track max cluster ID
     consensus_path = os.path.join(in_dir, "consensus.parquet")
     if os.path.exists(consensus_path):
         consensus_df = pq.read_table(consensus_path).to_pandas()
         for row in consensus_df.itertuples():
+            max_cluster_id = max(max_cluster_id, row.cluster_id)
             if row.cluster_id in cluster_dic:
                 mz = np.frombuffer(row.spectrum_mz, dtype=np.float32)
                 intensity = np.frombuffer(row.spectrum_intensity, dtype=np.float32)
@@ -1361,7 +1333,12 @@ def load_cluster_dic_optimized(in_dir):
                     'charge': row.charge,
                     'title': row.title
                 }
-    return cluster_dic
+    
+    # Also check scan_list for max cluster ID
+    if cluster_dic:
+        max_cluster_id = max(max_cluster_id, max(cluster_dic.keys()))
+    
+    return cluster_dic, max_cluster_id
 
 def _custom_merge_mzml_files(file_list, output_path, threads=8):
     """
@@ -1422,33 +1399,60 @@ def collect_scans_for_next_batch(cluster_dic, current_batch_folder, phase2_singl
 # Removed: save_spectra_batch - replaced by memory-efficient storage system
 
 
-def save_consensus_incremental(cluster_dic, consensus_parquet_path):
-    """Incrementally save consensus spectra"""
+def save_consensus_incremental(cluster_dic, consensus_parquet_path, max_existing_cluster_id=None):
+    """Incrementally save consensus spectra - optimized for incremental updates"""
     consensus_data = []
+    
+    # If max_existing_cluster_id is provided, only process new clusters
+    # This avoids checking existence for each cluster
     for cid, cdata in cluster_dic.items():
+        # Skip if this cluster ID is not new (if max_existing_cluster_id is provided)
+        if max_existing_cluster_id is not None and cid <= max_existing_cluster_id:
+            continue
+            
         spectrum = cdata.get("spectrum")
         if spectrum and 'peaks' in spectrum and len(spectrum['peaks']) > 0:
-            # Check if consensus already exists to avoid duplicates
-            if not consensus_exists(cid, consensus_parquet_path):
-                peaks = np.array(spectrum['peaks'], dtype=np.float32)
-                ch_str = str(spectrum.get('charge', '0')).replace('+', '')
-                charge_val = int(ch_str) if ch_str.isdigit() else 0
-                
-                consensus_data.append({
-                    "cluster_id": cid,
-                    "filename": f"consensus_{cid}",
-                    "scan": int(cid),
-                    "spectrum_mz": peaks[:, 0].tobytes(),
-                    "spectrum_intensity": peaks[:, 1].tobytes(),
-                    "precursor_mz": np.float32(spectrum.get('precursor_mz', 0)),
-                    "rtinseconds": np.float32(spectrum.get('rtinseconds', 0)),
-                    "charge": np.int32(charge_val),
-                    "title": str(spectrum.get('title', ''))
-                })
+            peaks = np.array(spectrum['peaks'], dtype=np.float32)
+            ch_str = str(spectrum.get('charge', '0')).replace('+', '')
+            charge_val = int(ch_str) if ch_str.isdigit() else 0
+            
+            consensus_data.append({
+                "cluster_id": cid,
+                "filename": f"consensus_{cid}",
+                "scan": int(cid),
+                "spectrum_mz": peaks[:, 0].tobytes(),
+                "spectrum_intensity": peaks[:, 1].tobytes(),
+                "precursor_mz": np.float32(spectrum.get('precursor_mz', 0)),
+                "rtinseconds": np.float32(spectrum.get('rtinseconds', 0)),
+                "charge": np.int32(charge_val),
+                "title": str(spectrum.get('title', ''))
+            })
     
     # Incrementally write
     if consensus_data:
+        print(f"[save_consensus_incremental] Adding {len(consensus_data)} new consensus spectra")
         save_consensus_batch(consensus_data, consensus_parquet_path)
+    else:
+        print(f"[save_consensus_incremental] No new consensus spectra to add")
+
+
+def get_max_existing_cluster_id(consensus_parquet_path):
+    """Get the maximum cluster ID from existing consensus file"""
+    if not os.path.exists(consensus_parquet_path):
+        return 0
+    
+    try:
+        table = pq.read_table(consensus_parquet_path)
+        if table.num_rows == 0:
+            return 0
+        
+        # Convert to pandas to get max value
+        df = table.to_pandas()
+        max_id = df['cluster_id'].max()
+        return int(max_id) if max_id is not None else 0
+    except Exception as e:
+        print(f"[Warning] Failed to get max cluster ID from {consensus_parquet_path}: {e}")
+        return 0
 
 
 def consensus_exists(cluster_id, consensus_parquet_path):
@@ -1617,7 +1621,7 @@ def cluster_one_folder(folder, checkpoint_dir, output_dir, tool_dir, precursor_t
         print(f"Summarize falcon phase 1 results took {summarize1_time - falcon1_end_time:.2f} s.")
 
         #load cluster dic time
-        cluster_dic = load_cluster_dic_optimized(checkpoint_dir)
+        cluster_dic, max_existing_cluster_id = load_cluster_dic_optimized(checkpoint_dir)
         load_cluster_dic_time = time.time()
         timing_log['Load cluster dic'] = load_cluster_dic_time - summarize1_time
         print(f"Load cluster dic took {load_cluster_dic_time - summarize1_time:.2f} s.")
@@ -1690,7 +1694,12 @@ def cluster_one_folder(folder, checkpoint_dir, output_dir, tool_dir, precursor_t
     
     # Save consensus spectra incrementally
     consensus_parquet_path = os.path.join(output_dir, "consensus.parquet")
-    save_consensus_incremental(cluster_dic, consensus_parquet_path)
+    if has_checkpoint:
+        # Incremental mode: use max cluster ID from loaded data
+        save_consensus_incremental(cluster_dic, consensus_parquet_path, max_existing_cluster_id)
+    else:
+        # Initial mode: no existing clusters, so max_existing_id = 0
+        save_consensus_incremental(cluster_dic, consensus_parquet_path, 0)
     
     # Save spectra incrementally (for both initial and incremental modes)
     if has_checkpoint:
@@ -1874,7 +1883,7 @@ def main():
 
     #print the version of the script
     #define the version of the script by "date_version"
-    __version__ = f"{datetime.datetime.now().strftime('%Y%m%d')}_1.2.4"
+    __version__ = f"{datetime.datetime.now().strftime('%Y%m%d')}_1.2.6"
     print(f"Running version: {__version__}")
     print(f"[Debug] Current working directory: {os.getcwd()}")
     
