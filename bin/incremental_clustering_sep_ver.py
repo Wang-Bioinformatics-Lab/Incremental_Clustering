@@ -161,14 +161,26 @@ class SpectrumStorage:
         if not spectra_data:
             return
         
-        # Check for existing spectra to avoid duplicates (batch query)
-        existing_keys = set()
-        if spectra_data:
+        # Use batch processing to avoid SQLite expression tree depth limit
+        batch_size = 10000  # Process in smaller batches
+        total_spectra = len(spectra_data)
+        
+        print(f"[store_spectra_batch] Processing {total_spectra} spectra in batches of {batch_size}")
+        
+        # Process in batches
+        for batch_start in range(0, total_spectra, batch_size):
+            batch_end = min(batch_start + batch_size, total_spectra)
+            batch_data = spectra_data[batch_start:batch_end]
+            
+            print(f"[store_spectra_batch] Processing batch {batch_start//batch_size + 1}/{(total_spectra + batch_size - 1)//batch_size} ({len(batch_data)} spectra)")
+            
+            # Check for existing spectra in this batch
+            existing_keys = set()
             with sqlite3.connect(self.index_db) as conn:
-                # Build batch query
+                # Build batch query for this batch only
                 conditions = []
                 query_params = []
-                for spec in spectra_data:
+                for spec in batch_data:
                     conditions.append("(filename = ? AND scan = ?)")
                     query_params.extend([str(spec['filename']), int(spec['scan'])])
                 
@@ -180,66 +192,68 @@ class SpectrumStorage:
                 
                 for row in cursor.fetchall():
                     existing_keys.add((row[0], row[1]))
-        
-        # Filter out existing spectra
-        new_spectra = [spec for spec in spectra_data 
-                      if (spec['filename'], spec['scan']) not in existing_keys]
-        
-        if not new_spectra:
-            print(f"[store_spectra_batch] All {len(spectra_data)} spectra already exist, skipping")
-            return
-        
-        print(f"[store_spectra_batch] Adding {len(new_spectra)} new spectra out of {len(spectra_data)}")
-        
-        # Prepare data for new spectra only
-        index_data = []
-        binary_data = b''
-        spectrum_sizes = []
-        
-        for spec in new_spectra:
-            filename = spec['filename']
-            scan = spec['scan']
-            spectrum = {
-                'peaks': spec.get('peaks', []),
-                'precursor_mz': spec.get('precursor_mz', 0.0),
-                'rtinseconds': spec.get('rtinseconds', 0.0),
-                'charge': spec.get('charge', 0)
-            }
             
-            # Pack spectrum
-            spectrum_data = self._pack_spectrum(spectrum)
-            binary_data += spectrum_data
-            spectrum_sizes.append(len(spectrum_data))
+            # Filter out existing spectra
+            new_spectra = [spec for spec in batch_data 
+                          if (spec['filename'], spec['scan']) not in existing_keys]
+            
+            if not new_spectra:
+                print(f"[store_spectra_batch] All {len(batch_data)} spectra in batch already exist, skipping")
+                continue
+            
+            print(f"[store_spectra_batch] Adding {len(new_spectra)} new spectra out of {len(batch_data)} in batch")
+            
+            # Prepare data for new spectra only
+            index_data = []
+            binary_data = b''
+            spectrum_sizes = []
+            
+            for spec in new_spectra:
+                filename = spec['filename']
+                scan = spec['scan']
+                spectrum = {
+                    'peaks': spec.get('peaks', []),
+                    'precursor_mz': spec.get('precursor_mz', 0.0),
+                    'rtinseconds': spec.get('rtinseconds', 0.0),
+                    'charge': spec.get('charge', 0)
+                }
+                
+                # Pack spectrum
+                spectrum_data = self._pack_spectrum(spectrum)
+                binary_data += spectrum_data
+                spectrum_sizes.append(len(spectrum_data))
+            
+            # Write binary data and get global offsets
+            with open(self.binary_file, 'ab') as f:
+                file_start_offset = f.tell()
+                f.write(binary_data)
+            
+            # Calculate global offsets for each spectrum
+            offsets = []
+            current_offset = file_start_offset
+            for size in spectrum_sizes:
+                offsets.append(current_offset)
+                current_offset += size
+            
+            # Write index data
+            for i, spec in enumerate(new_spectra):
+                index_data.append((
+                    str(spec['filename']), int(spec['scan']), offsets[i], spectrum_sizes[i],
+                    spec.get('precursor_mz', 0.0),
+                    spec.get('rtinseconds', 0.0),
+                    spec.get('charge', 0),
+                    len(spec.get('peaks', []))
+                ))
+            
+            with sqlite3.connect(self.index_db) as conn:
+                conn.executemany("""
+                    INSERT OR REPLACE INTO spectrum_index 
+                    (filename, scan, offset, size, precursor_mz, rtinseconds, charge, peak_count)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """, index_data)
+                conn.commit()
         
-        # Write binary data and get global offsets
-        with open(self.binary_file, 'ab') as f:
-            file_start_offset = f.tell()
-            f.write(binary_data)
-        
-        # Calculate global offsets for each spectrum
-        offsets = []
-        current_offset = file_start_offset
-        for size in spectrum_sizes:
-            offsets.append(current_offset)
-            current_offset += size
-        
-        # Write index data
-        for i, spec in enumerate(new_spectra):
-            index_data.append((
-                str(spec['filename']), int(spec['scan']), offsets[i], spectrum_sizes[i],
-                spec.get('precursor_mz', 0.0),
-                spec.get('rtinseconds', 0.0),
-                spec.get('charge', 0),
-                len(spec.get('peaks', []))
-            ))
-        
-        with sqlite3.connect(self.index_db) as conn:
-            conn.executemany("""
-                INSERT OR REPLACE INTO spectrum_index 
-                (filename, scan, offset, size, precursor_mz, rtinseconds, charge, peak_count)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """, index_data)
-            conn.commit()
+        print(f"[store_spectra_batch] Completed processing all {total_spectra} spectra")
     
     def get_spectrum(self, filename: str, scan: int) -> dict:
         """Get spectrum using memory-mapped access"""
@@ -267,35 +281,45 @@ class SpectrumStorage:
         if not scan_list:
             return {}
         
-        # Query all at once using OR conditions instead of IN with tuples
-        conditions = []
-        query_params = []
-        for filename, scan in scan_list:
-            conditions.append("(filename = ? AND scan = ?)")
-            query_params.extend([str(filename), int(scan)])
+        # Use batch processing to avoid SQLite expression tree depth limit
+        batch_size = 10000  # Process in smaller batches
+        total_scans = len(scan_list)
+        all_spectra = {}
         
-        where_clause = " OR ".join(conditions)
+        # Process in batches
+        for batch_start in range(0, total_scans, batch_size):
+            batch_end = min(batch_start + batch_size, total_scans)
+            batch_scan_list = scan_list[batch_start:batch_end]
+            
+            # Query this batch
+            conditions = []
+            query_params = []
+            for filename, scan in batch_scan_list:
+                conditions.append("(filename = ? AND scan = ?)")
+                query_params.extend([str(filename), int(scan)])
+            
+            where_clause = " OR ".join(conditions)
+            
+            with sqlite3.connect(self.index_db) as conn:
+                cursor = conn.execute(f"""
+                    SELECT filename, scan, offset, size FROM spectrum_index 
+                    WHERE {where_clause}
+                """, query_params)
+                results = cursor.fetchall()
+            
+            # Memory-mapped batch read for this batch
+            if results and self.binary_file.stat().st_size > 0:
+                with open(self.binary_file, 'rb') as f:
+                    with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
+                        for filename, scan, offset, size in results:
+                            data = mm[offset:offset + size]
+                            spectrum = self._unpack_spectrum(data)
+                            all_spectra[(filename, scan)] = spectrum
         
-        with sqlite3.connect(self.index_db) as conn:
-            cursor = conn.execute(f"""
-                SELECT filename, scan, offset, size FROM spectrum_index 
-                WHERE {where_clause}
-            """, query_params)
-            results = cursor.fetchall()
-        
-        # Memory-mapped batch read
-        spectra = {}
-        if results and self.binary_file.stat().st_size > 0:
-            with open(self.binary_file, 'rb') as f:
-                with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
-                    for filename, scan, offset, size in results:
-                        data = mm[offset:offset + size]
-                        spectrum = self._unpack_spectrum(data)
-                        spectra[(filename, scan)] = spectrum
-        else:
+        if not all_spectra:
             print(f"[Warning] No spectra found in storage or binary file is empty")
         
-        return spectra
+        return all_spectra
     
     def get_storage_stats(self) -> dict:
         """Get storage statistics"""
