@@ -214,14 +214,23 @@ class SpectrumStorage:
                     len(spec.get('peaks', []))
                 ))
             
-            # Directly insert all, let SQLite handle deduplication
+            # Try INSERT first, fallback to INSERT OR REPLACE if there are conflicts
             with sqlite3.connect(self.index_db) as conn:
-                conn.executemany("""
-                    INSERT OR REPLACE INTO spectrum_index 
-                    (filename, scan, offset, size, precursor_mz, rtinseconds, charge, peak_count)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """, index_data)
-                conn.commit()
+                try:
+                    conn.executemany("""
+                        INSERT INTO spectrum_index 
+                        (filename, scan, offset, size, precursor_mz, rtinseconds, charge, peak_count)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """, index_data)
+                    conn.commit()
+                except sqlite3.IntegrityError as e:
+                    print(f"[store_spectra_batch] IntegrityError detected, using INSERT OR REPLACE: {e}")
+                    conn.executemany("""
+                        INSERT OR REPLACE INTO spectrum_index 
+                        (filename, scan, offset, size, precursor_mz, rtinseconds, charge, peak_count)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """, index_data)
+                    conn.commit()
         
         print(f"[store_spectra_batch] Completed processing all {total_spectra} spectra")
     
@@ -798,21 +807,18 @@ def write_mzml(cluster_dic, out_path, current_batch_folder, checkpoint_dir, samp
         scan_list = data.get('scan_list', [])
         sample_list = data.get('sample_list', [])
         
+        # Generate sample_list for large clusters if not exists
+        if len(scan_list) > sample_threshold and not sample_list:
+            # Large cluster without sample_list, need to sample
+            sample_list = random.sample(scan_list, sample_threshold)
+            data['sample_list'] = sample_list  # update cluster_dic
+        
+        # Always add consensus spectrum if exists
         if 'spectrum' in data:
-            # handle cluster with consensus spectrum
             _add_spectrum(exp, data['spectrum'], cid)
-        elif len(scan_list) <= sample_threshold:
-            # handle small cluster, only use consensus spectrum
-            pass
-        else:
-            # large cluster
-            if not sample_list:
-                # sample_list is empty, need to sample
-                sample_list = random.sample(scan_list, sample_threshold)
-                data['sample_list'] = sample_list  # update cluster_dic
-                print(f"[Debug] Created sample_list for cluster {cid}: {len(sample_list)} samples")
-            
-            # use spectra in sample_list
+        
+        # For large clusters, also add sample_list spectra
+        if len(scan_list) > sample_threshold and sample_list:
             for i, scan_item in enumerate(sample_list):
                 if len(scan_item) == 4:  # (filename, scan, precursor_mz, retention_time)
                     fp, sc, precursor_mz, retention_time = scan_item
@@ -1790,7 +1796,13 @@ def cluster_one_folder(folder, checkpoint_dir, output_dir, tool_dir, precursor_t
             print(f"[cluster_one_folder] Stored {len(all_spectra)} spectra, total: {stats['spectrum_count']}, size: {stats['total_size_mb']:.1f}MB")
     
     # Save scan_list and sample_list to feather files, and spectra to memory-efficient storage
-    save_cluster_dic_optimized(cluster_dic, output_dir, singletons=new_singletons2 if 'new_singletons2' in locals() else singletons, current_batch_folder=folder)
+    # Save after all processing is complete (both initial and incremental modes)
+    if has_checkpoint:
+        # Incremental mode
+        save_cluster_dic_optimized(cluster_dic, output_dir, singletons=new_singletons2 if 'new_singletons2' in locals() else singletons, current_batch_folder=folder)
+    else:
+        # Initial mode
+        save_cluster_dic_optimized(cluster_dic, output_dir, singletons=singletons, current_batch_folder=folder)
     
     print(f"[cluster_one_folder] Updated cluster_dic saved at {output_dir}")
     save_cluster_dic_end_time = time.time()
@@ -1883,7 +1895,7 @@ def main():
 
     #print the version of the script
     #define the version of the script by "date_version"
-    __version__ = f"{datetime.datetime.now().strftime('%Y%m%d')}_1.2.6"
+    __version__ = f"{datetime.datetime.now().strftime('%Y%m%d')}_1.2.8"
     print(f"Running version: {__version__}")
     print(f"[Debug] Current working directory: {os.getcwd()}")
     
