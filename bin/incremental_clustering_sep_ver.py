@@ -256,44 +256,49 @@ class SpectrumStorage:
                 return self._unpack_spectrum(data)
     
     def get_spectra_batch(self, scan_list: list) -> dict:
-        """Get multiple spectra efficiently"""
+        """Get multiple spectra efficiently using temporary table to avoid expression tree depth limit"""
         if not scan_list:
             return {}
         
-        # Use batch processing to avoid SQLite expression tree depth limit
-        batch_size = 10000  # Process in smaller batches
-        total_scans = len(scan_list)
         all_spectra = {}
         
-        # Process in batches
-        for batch_start in range(0, total_scans, batch_size):
-            batch_end = min(batch_start + batch_size, total_scans)
-            batch_scan_list = scan_list[batch_start:batch_end]
+        with sqlite3.connect(self.index_db) as conn:
+            # Create temporary table for the scan list
+            conn.execute("""
+                CREATE TEMPORARY TABLE temp_scan_lookup (
+                    filename TEXT,
+                    scan INTEGER,
+                    PRIMARY KEY (filename, scan)
+                )
+            """)
             
-            # Query this batch
-            conditions = []
-            query_params = []
-            for filename, scan in batch_scan_list:
-                conditions.append("(filename = ? AND scan = ?)")
-                query_params.extend([str(filename), int(scan)])
+            # Insert scan list into temporary table
+            scan_data = [(str(filename), int(scan)) for filename, scan in scan_list]
+            conn.executemany("""
+                INSERT OR IGNORE INTO temp_scan_lookup (filename, scan) 
+                VALUES (?, ?)
+            """, scan_data)
             
-            where_clause = " OR ".join(conditions)
+            # Query using JOIN instead of WHERE clause
+            cursor = conn.execute("""
+                SELECT s.filename, s.scan, s.offset, s.size 
+                FROM spectrum_index s
+                INNER JOIN temp_scan_lookup t ON s.filename = t.filename AND s.scan = t.scan
+            """)
+            results = cursor.fetchall()
             
-            with sqlite3.connect(self.index_db) as conn:
-                cursor = conn.execute(f"""
-                    SELECT filename, scan, offset, size FROM spectrum_index 
-                    WHERE {where_clause}
-                """, query_params)
-                results = cursor.fetchall()
-            
-            # Memory-mapped batch read for this batch
-            if results and self.binary_file.stat().st_size > 0:
-                with open(self.binary_file, 'rb') as f:
-                    with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
-                        for filename, scan, offset, size in results:
-                            data = mm[offset:offset + size]
-                            spectrum = self._unpack_spectrum(data)
-                            all_spectra[(filename, scan)] = spectrum
+            # Drop temporary table
+            conn.execute("DROP TABLE temp_scan_lookup")
+            conn.commit()
+        
+        # Memory-mapped batch read
+        if results and self.binary_file.stat().st_size > 0:
+            with open(self.binary_file, 'rb') as f:
+                with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
+                    for filename, scan, offset, size in results:
+                        data = mm[offset:offset + size]
+                        spectrum = self._unpack_spectrum(data)
+                        all_spectra[(filename, scan)] = spectrum
         
         if not all_spectra:
             print(f"[Warning] No spectra found in storage or binary file is empty")
@@ -369,26 +374,38 @@ class SpectrumStorage:
         print(f"[cleanup_storage] Cleanup completed. New size: {stats['binary_file_size_mb']:.1f}MB")
     
     def remove_spectra(self, scan_list: list):
-        """Remove specific spectra from storage"""
+        """Remove specific spectra from storage using temporary table to avoid expression tree depth limit"""
         if not scan_list:
             return
         
-        # Build batch delete query
-        conditions = []
-        query_params = []
-        for filename, scan in scan_list:
-            conditions.append("(filename = ? AND scan = ?)")
-            query_params.extend([str(filename), int(scan)])
-        
-        where_clause = " OR ".join(conditions)
-        
         with sqlite3.connect(self.index_db) as conn:
-            # Delete from index
-            cursor = conn.execute(f"""
+            # Create temporary table for the scan list
+            conn.execute("""
+                CREATE TEMPORARY TABLE temp_scan_delete (
+                    filename TEXT,
+                    scan INTEGER,
+                    PRIMARY KEY (filename, scan)
+                )
+            """)
+            
+            # Insert scan list into temporary table
+            scan_data = [(str(filename), int(scan)) for filename, scan in scan_list]
+            conn.executemany("""
+                INSERT OR IGNORE INTO temp_scan_delete (filename, scan) 
+                VALUES (?, ?)
+            """, scan_data)
+            
+            # Delete using JOIN instead of WHERE clause
+            cursor = conn.execute("""
                 DELETE FROM spectrum_index 
-                WHERE {where_clause}
-            """, query_params)
+                WHERE (filename, scan) IN (
+                    SELECT filename, scan FROM temp_scan_delete
+                )
+            """)
             deleted_count = cursor.rowcount
+            
+            # Drop temporary table
+            conn.execute("DROP TABLE temp_scan_delete")
             conn.commit()
         
         print(f"[remove_spectra] Removed {deleted_count} spectra from index")
@@ -1895,7 +1912,7 @@ def main():
 
     #print the version of the script
     #define the version of the script by "date_version"
-    __version__ = f"{datetime.datetime.now().strftime('%Y%m%d')}_1.2.8"
+    __version__ = f"{datetime.datetime.now().strftime('%Y%m%d')}_1.2.9"
     print(f"Running version: {__version__}")
     print(f"[Debug] Current working directory: {os.getcwd()}")
     
