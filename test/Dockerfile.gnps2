@@ -20,3 +20,5 @@ RUN mamba create -n python310 python=3.10 -y
 
 #Installing nextflow
 RUN mamba install -y -n python310 -c bioconda nextflow=24.04.4
+
+WORKDIR /test

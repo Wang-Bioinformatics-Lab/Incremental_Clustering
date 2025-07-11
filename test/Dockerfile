@@ -6,3 +6,5 @@ RUN apt-get update -y \
 
 # Installing Nextflow
 RUN mamba install -c bioconda nextflow=24.04.*
+
+WORKDIR /test
