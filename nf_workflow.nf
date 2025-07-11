@@ -1,7 +1,7 @@
 #!/usr/bin/env nextflow
 nextflow.enable.dsl=2
 
-params.input_spectra = "/home/user/research/Incremental_Clustering/data"
+params.input_spectra = "./data"
 
 //This publish dir is mostly  useful when we want to import modules in other workflows, keep it here usually don't change it
 
