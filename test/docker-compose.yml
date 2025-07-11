@@ -1,0 +1,9 @@
+version: '3.8'
+
+services:
+  test_docker:
+    container_name: test_docker
+    build: .
+    volumes:
+      - ..:/test
+    command: tail -f /dev/null
