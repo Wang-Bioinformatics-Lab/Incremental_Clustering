@@ -71,7 +71,7 @@ process CLUSTERING {
 
 workflow {
 
-    CLUSTERING(params.input_spectra)
+    CLUSTERING(Channel.fromPath(params.input_spectra))
 
     // Alternatively we can put everyhthing in the main from the above right here
 }
