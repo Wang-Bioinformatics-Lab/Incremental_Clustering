@@ -1,9 +1,18 @@
-version: '3.8'
-
 services:
   test_docker:
     container_name: test_docker
-    build: .
+    build:
+      context: .
+      dockerfile: Dockerfile
+    volumes:
+      - ..:/test
+    command: tail -f /dev/null
+
+  test_docker_gnps2:
+    container_name: test_docker_gnps2
+    build:
+      context: .
+      dockerfile: Dockerfile.gnps2
     volumes:
       - ..:/test
     command: tail -f /dev/null
