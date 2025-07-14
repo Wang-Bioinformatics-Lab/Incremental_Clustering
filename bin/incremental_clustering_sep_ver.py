@@ -37,12 +37,13 @@ import gc
 import mmap
 import struct
 import sqlite3
+from numpy_optimized_storage import NumpySpectrumStorage
 
 ##############################################################################
 # 0) MEMORY-EFFICIENT SPECTRUM STORAGE SYSTEM
 ##############################################################################
 
-class SpectrumStorage:
+class SpectrumStorage(NumpySpectrumStorage):
     """
     Memory-efficient spectrum storage using memory-mapped files and SQLite indexing.
     
@@ -417,17 +418,12 @@ class SpectrumStorage:
 _spectrum_storage_instances = {}
 
 def get_spectrum_storage(storage_dir: str = None) -> SpectrumStorage:
-    """Get or create spectrum storage instance for specific directory"""
+    """Get or create spectrum storage instance for specific directory (numpy optimized)"""
     if storage_dir is None:
         storage_dir = "spectrum_storage"
-    
-    # Use absolute path as key to avoid conflicts
     abs_storage_dir = os.path.abspath(storage_dir)
-    
-    # Check if instance already exists for this directory
     if abs_storage_dir not in _spectrum_storage_instances:
         _spectrum_storage_instances[abs_storage_dir] = SpectrumStorage(abs_storage_dir)
-    
     return _spectrum_storage_instances[abs_storage_dir]
 
 def migrate_old_storage_if_needed(checkpoint_dir: str):
@@ -1003,7 +999,9 @@ def _process_fetch_file(file_path, scan_pairs, temp_dir, current_batch_folder, c
 def _add_spectrum(experiment, sp_data, scan_id):
     """
     Helper to add a single MSSpectrum to an MSExperiment.
+    auto compatible with numpy structure and original structure.
     """
+    import pyopenms as oms
     s = oms.MSSpectrum()
     s.setRT(float(sp_data.get('rtinseconds', 0)))
     s.setMSLevel(2)
@@ -1016,11 +1014,17 @@ def _add_spectrum(experiment, sp_data, scan_id):
     else:
         prec.setCharge(0)
     s.setPrecursors([prec])
-    # Use unique scan_id
     unique_id = sp_data.get('unique_scan', scan_id)
     s.setNativeID(f"controllerType=0 controllerNumber=1 scan={unique_id}")
+    # auto compatible with numpy structure
     if 'peaks' in sp_data:
-        mz_array, int_array = zip(*sp_data['peaks'])
+        peaks = sp_data['peaks']
+    elif 'mz_array' in sp_data and 'intensity_array' in sp_data:
+        peaks = list(zip(sp_data['mz_array'], sp_data['intensity_array']))
+    else:
+        peaks = []
+    if peaks:
+        mz_array, int_array = zip(*peaks)
         s.set_peaks([mz_array, int_array])
     experiment.addSpectrum(s)
 
