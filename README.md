@@ -53,15 +53,4 @@ To cluster a new batch of spectra incrementally based on previous results:
   The file is located at:  
   `/results/consensus.mzML`
 
-## 5.For Corteva Ometalab Workflow Deployment
 
-First, navigate to the workflow directory:
-
-```bash
-cd /ometa/flow/workflows_user
-```
-Then, run the following command:
-
-```bash
-curl -L  https://github.com/Wang-Bioinformatics-Lab/Incremental_Clustering/archive/refs/heads/master.zip | bsdtar -xvf -
-```
