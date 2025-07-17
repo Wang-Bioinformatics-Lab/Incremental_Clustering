@@ -94,7 +94,11 @@ process CLUSTERING {
 
 workflow {
 
-    (_clustered_data_ch, _, _, _, _, _, _, _) = CLUSTERING(Channel.fromPath(params.input_spectra))
+    input_spectra_ch = Channel.fromPath(params.input_spectra)
+
+    // TODO: We should fix this so that relative paths work
+
+    (_clustered_data_ch, _, _, _, _, _, _, _) = CLUSTERING(input_spectra_ch)
 
     // Here we do networking
     if (params.do_networking == "Yes") {
@@ -111,6 +115,6 @@ workflow {
         "index_single_charge", \
         enable_peak_filtering)
 
-        _index_pairs_ch.collectFile(name: "merged_pairs.tsv", storeDir: "$_publishdir", keepHeader: true)
+        _index_pairs_ch.collectFile(name: "networking/merged_pairs.tsv", storeDir: "$_publishdir", keepHeader: true)
     }
 }
