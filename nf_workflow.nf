@@ -96,7 +96,7 @@ workflow {
 
     input_spectra_ch = Channel.fromPath(params.input_spectra)
 
-    // TODO: We should fix this so that relative paths work
+    // TODO: We should fix this so that relative paths work for the checkpoints
 
     (_clustered_data_ch, _, _, _, _, _, _, _) = CLUSTERING(input_spectra_ch)
 
