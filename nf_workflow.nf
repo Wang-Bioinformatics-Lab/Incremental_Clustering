@@ -111,5 +111,7 @@ workflow {
         params.parallelism, \
         "index_single_charge", \
         enable_peak_filtering)
+
+        _index_pairs_ch.collectFile(name: "merged_pairs.tsv", storeDir: "$_publishdir", keepHeader: true)
     }
 }
