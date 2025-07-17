@@ -1,7 +1,7 @@
 workflowname: incremental_clustering_nextflow_workflow
 workflowdescription: incremental_clustering_nextflow_workflow
 workflowlongdescription: This is the incremental_clustering_nextflow_workflow
-workflowversion: "2025.7.15"
+workflowversion: "2025.7.16"
 workflowfile: nf_workflow.nf
 workflowautohide: false
 adminonly: false
@@ -67,3 +67,8 @@ parameterlist:
       formplaceholder: Enter the eps
       formvalue: "0.1"
       tooltip: "clustering sensitivity"
+
+    - displayname: Networking Parameters
+      paramtype: section
+
+    
