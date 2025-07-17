@@ -71,4 +71,25 @@ parameterlist:
     - displayname: Networking Parameters
       paramtype: section
 
+    - displayname: do_networking
+      paramtype: select
+      nf_paramname: do_networking
+      formvalue: "Yes"
+      options:
+        - value: "Yes"
+          display: "Yes"
+        - value: "No"
+          display: "No"
+    
+    - displayname: min_cosine
+      paramtype: text
+      nf_paramname: min_cosine
+      formplaceholder: Enter the min_cosine
+      formvalue: "0.7"
+
+    - displayname: min_matched_peaks
+      paramtype: text
+      nf_paramname: min_matched_peaks
+      formplaceholder: Enter the min_matched_peaks
+      formvalue: "3"
     

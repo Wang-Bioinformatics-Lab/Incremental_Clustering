@@ -21,7 +21,6 @@ params.parallelism = 100
 params.maxforks = 24
 
 params.min_matched_peaks = 6
-params.pm_tolerance = 0.5
 params.min_cosine = 0.7
 params.max_shift = 1000
 
