@@ -32,6 +32,28 @@ Views:
             <a target="_blank" href="https://metabolomics-usi.gnps2.org/dashinterface/?usi1=mzspec:GNPS2:TASK-${ task }-nf_output/results/consensus.mzML:scan:${ row[ "cluster" ] }">View Spectrum</a>
         `; } }]'
 
+-   name: Cluster Summary
+    displayname: Cluster Summary Table
+    viewname: clustersummary
+    displaytype: datatable_serverbig
+    parameters:
+        filename: nf_output/results/cluster_summary.tsv
+        columns:
+            -   title: "cluster index"
+                data: "cluster index"
+            -   title: "# spectra"
+                data: "number of spectra"
+            -   title: "Parent mass"
+                data: "parent mass"
+            -   title: "precursor charge"
+                data: "precursor charge"
+            -   title: "precursor mass"
+                data: "precursor mass"
+            -   title: "sum(precursor intensity)"
+                data: "sum(precursor intensity)"
+            -   title: "RTMean"
+                data: "RTMean"
+
 -   name: section
     displayname: Downstream Analysis
     viewname: section
