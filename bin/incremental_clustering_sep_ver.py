@@ -1885,6 +1885,54 @@ def finalize_results(cluster_dic, output_dir, current_batch_files=None):
 
     print(f"[finalize_results] Wrote final cluster_info.tsv: {out_tsv}")
 
+    # add cluster_summary.tsv to output_dir
+    summary_tsv = os.path.join(output_dir, "cluster_summary.tsv")
+    summary_fields = [
+        'cluster index',
+        'number of spectra',
+        'parent mass',
+        'precursor charge',
+        'precursor mass',
+        'sum(precursor intensity)',
+        'RTMean'
+    ]
+    with open(summary_tsv, 'w', newline='') as f:
+        w = DictWriter(f, fieldnames=summary_fields, delimiter='\t')
+        w.writeheader()
+        for cid, cdata in cluster_dic.items():
+            scan_list = cdata.get('scan_list', [])
+            n_spectra = len(scan_list)
+            parent_masses = []
+            charges = []
+            rts = []
+            for scan_item in scan_list:
+                if len(scan_item) == 4:
+                    _, _, precursor_mz, retention_time = scan_item
+                    parent_masses.append(precursor_mz)
+                    rts.append(retention_time)
+                else:
+                    parent_masses.append(0.0)
+                    rts.append(0.0)
+            charge_val = 1
+            precursor_mass_val = parent_masses[0] if parent_masses else 0.0
+            if 'spectrum' in cdata:
+                spectrum = cdata['spectrum']
+                if 'charge' in spectrum and spectrum['charge'] is not None:
+                    charge_val = spectrum['charge']
+                if 'precursor_mz' in spectrum and spectrum['precursor_mz'] is not None:
+                    precursor_mass_val = spectrum['precursor_mz']
+            rt_mean = sum(rts)/len(rts) if rts else 0.0
+            w.writerow({
+                'cluster index': cid,
+                'number of spectra': n_spectra,
+                'parent mass': precursor_mass_val,
+                'precursor charge': charge_val,
+                'precursor mass': precursor_mass_val,
+                'sum(precursor intensity)': 0,
+                'RTMean': rt_mean
+            })
+    print(f"[finalize_results] Wrote cluster_summary.tsv: {summary_tsv}")
+
 ##############################################################################
 # 5) MAIN
 ##############################################################################
