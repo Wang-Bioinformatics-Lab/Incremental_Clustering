@@ -69,6 +69,7 @@ process CLUSTERING {
     file "results/*txt" optional true
     file "results/*db" optional true
     file "results/*bin" optional true
+    file "results/output_file_symlink/*" optional true
 
     // This is necessary because the glibc libraries are not always used in the conda environment, and defaults to the system which could be old
     beforeScript 'export LD_LIBRARY_PATH=\$LD_LIBRARY_PATH:$CONDA_PREFIX/lib'
