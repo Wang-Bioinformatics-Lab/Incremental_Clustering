@@ -1933,6 +1933,46 @@ def finalize_results(cluster_dic, output_dir, current_batch_files=None):
             })
     print(f"[finalize_results] Wrote cluster_summary.tsv: {summary_tsv}")
 
+    # Create output_file_symlink directory and symlinks for all original scan paths
+    symlink_dir = os.path.join(output_dir, "output_file_symlink")
+    os.makedirs(symlink_dir, exist_ok=True)
+    
+    # Collect all unique file paths from cluster_dic scan_list
+    # scan_list contains tuples: (absolute_file_path, scan_number, precursor_mz, retention_time)
+    unique_file_paths = set()
+    for cid, cdata in cluster_dic.items():
+        for scan_item in cdata['scan_list']:
+            if len(scan_item) >= 2:
+                absolute_file_path = scan_item[0]  # First element is the absolute path to original mzML file
+                unique_file_paths.add(absolute_file_path)
+    
+    # Create symlinks for each unique file path
+    symlinks_created = 0
+    for file_path in unique_file_paths:
+        if os.path.exists(file_path):
+            # Generate a safe symlink name using basename
+            symlink_name = os.path.basename(file_path)
+            symlink_path = os.path.join(symlink_dir, symlink_name)
+            
+            # Handle naming conflicts by adding a counter
+            counter = 1
+            original_symlink_path = symlink_path
+            while os.path.exists(symlink_path):
+                name, ext = os.path.splitext(original_symlink_path)
+                symlink_path = f"{name}_{counter}{ext}"
+                counter += 1
+            
+            try:
+                # Create relative symlink to the original file path
+                os.symlink(os.path.abspath(file_path), symlink_path)
+                symlinks_created += 1
+            except OSError as e:
+                print(f"[Warning] Failed to create symlink for {file_path}: {e}")
+        else:
+            print(f"[Warning] Original file not found, skipping symlink creation: {file_path}")
+    
+    print(f"[finalize_results] Created {symlinks_created} symlinks in {symlink_dir}")
+
 ##############################################################################
 # 5) MAIN
 ##############################################################################
