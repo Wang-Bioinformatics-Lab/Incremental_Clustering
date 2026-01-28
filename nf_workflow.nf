@@ -1,7 +1,7 @@
 #!/usr/bin/env nextflow
 nextflow.enable.dsl=2
 
-params.input_spectra = "./data"
+params.input_spectra = "./data/round1"
 params.checkpoint_dir  = "./checkpoint"
 
 // Falcon parameters with defaults
@@ -71,10 +71,14 @@ process CLUSTERING {
     file "results/*bin" optional true
 
     // This is necessary because the glibc libraries are not always used in the conda environment, and defaults to the system which could be old
-    beforeScript 'export LD_LIBRARY_PATH=\$LD_LIBRARY_PATH:$CONDA_PREFIX/lib'
+    // Put conda lib directory FIRST to prioritize conda's libstdc++ over system version
+    beforeScript 'export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:\$LD_LIBRARY_PATH'
 
     script:
     """
+    # Ensure conda's libstdc++ is used before system version
+    export LD_LIBRARY_PATH=\$CONDA_PREFIX/lib:\${LD_LIBRARY_PATH}
+    
     mkdir results
 
     python3 $TOOL_FOLDER/incremental_clustering_sep_ver.py \
