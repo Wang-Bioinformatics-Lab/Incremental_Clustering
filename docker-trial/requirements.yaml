@@ -1,0 +1,23 @@
+name: hyper-spec
+channels:
+  - rapidsai
+  - nvidia
+  - conda-forge
+dependencies:
+  - python=3.12
+  - cuml
+  - cudatoolkit
+  - cython
+  - configargparse
+  - pip
+  - numpy
+  - pandas
+  - scipy
+  - scikit-learn<1.6
+  - scikit-learn-intelex
+  - fastcluster
+  - joblib
+  - bottleneck
+  - numba
+  - tqdm
+  - s3cmd

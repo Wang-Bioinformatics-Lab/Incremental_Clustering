@@ -464,18 +464,23 @@ def migrate_old_storage_if_needed(checkpoint_dir: str):
 ##############################################################################
 
 def parse_scan_identifier(scan_id):
-    """Parse scan identifier that may contain full path with underscore and scan number"""
+    """
+    Parse scan identifier that may contain full path with underscore and scan number.
+    Supports .mzML_123 and .mgf_123 (e.g. unique_scan when input is MGF: /path/sample.mgf_123).
+    """
     if isinstance(scan_id, str) and '_' in scan_id:
-        # Try to find the last occurrence of .mzML_ followed by numbers
         import re
-        match = re.search(r'\.mzML_(\d+)$', scan_id)
-        if match:
-            scan_number = int(match.group(1))
-            file_path = scan_id[:-len(match.group(0))] + '.mzML'
-            return file_path, scan_number
-    
-    # Fallback: assume scan_id is already a scan number
-    return None, int(scan_id) if isinstance(scan_id, (int, str)) else scan_id
+        for pattern, suffix_ext in [(r'\.mzML_(\d+)$', '.mzML'), (r'\.mgf_(\d+)$', '.mgf'), (r'\.mzml_(\d+)$', '.mzML')]:
+            match = re.search(pattern, scan_id, re.IGNORECASE)
+            if match:
+                scan_number = int(match.group(1))
+                file_path = scan_id[:-len(match.group(0))] + suffix_ext
+                return file_path, scan_number
+    # Fallback: assume scan_id is a scan number (int or string of digits)
+    try:
+        return None, int(scan_id) if isinstance(scan_id, (int, str)) else scan_id
+    except (ValueError, TypeError):
+        return None, scan_id
 
 def is_in_current_batch(fp, current_batch_folder):
     return os.path.commonpath([os.path.abspath(fp), os.path.abspath(current_batch_folder)]) == os.path.abspath(current_batch_folder)
@@ -518,9 +523,21 @@ def summarize_output(output_path,summarize_script="summarize_results.py", falcon
     proc.wait()
     return os.path.join(output_dir, "cluster_info.tsv")
 
-def get_original_file_path(filename, original_filepah):
-    # Return absolute path to ensure consistency with database storage
-    return os.path.abspath(os.path.join(original_filepah, filename))
+def get_original_file_path(filename, original_file_path):
+    """
+    Return absolute path to the spectrum file. Supports both .mzML and .mgf:
+    tries filename as-is, then stem.mgf, then stem.mzML so cluster_info works
+    whether summarizer wrote .mzML or .mgf.
+    """
+    path = os.path.abspath(os.path.join(original_file_path, filename))
+    if os.path.isfile(path):
+        return path
+    stem = os.path.splitext(filename)[0]
+    for ext in (".mgf", ".mzML", ".mzml"):
+        alt = os.path.abspath(os.path.join(original_file_path, stem + ext))
+        if os.path.isfile(alt):
+            return alt
+    return path
 
 def read_mzml(filepath):
     """
@@ -553,6 +570,61 @@ def read_mzml(filepath):
         print(f"[Error] Failed to read mzML file {filepath}: {e}")
         raise
     return spectra
+
+
+def read_mgf_spectra(filepath):
+    """
+    Read MGF file and return list of spectrum dicts in the same shape as read_mzml:
+    peaks, precursor_mz, rtinseconds, scans (int), charge.
+    Used so that write_mzml / write_singletons_mzml can work with either mzML or MGF input.
+    """
+    raw = read_mgf(filepath)
+    spectra = []
+    for idx, spec in enumerate(raw):
+        pep = spec.get("pepmass", spec.get("PEPMASS", 0))
+        if isinstance(pep, str):
+            pep = pep.strip().split()[0] if pep.strip() else 0
+        try:
+            precursor_mz = float(pep) if pep else 0.0
+        except (TypeError, ValueError):
+            precursor_mz = 0.0
+        rt = spec.get("rtinseconds", spec.get("RTINSECONDS", 0))
+        try:
+            rtinseconds = float(rt) if rt else 0.0
+        except (TypeError, ValueError):
+            rtinseconds = 0.0
+        scan_raw = spec.get("scans", spec.get("scan", str(idx + 1)))
+        try:
+            scans = int(scan_raw) if scan_raw is not None and str(scan_raw).strip() else (idx + 1)
+        except (TypeError, ValueError):
+            scans = idx + 1
+        ch = spec.get("charge", spec.get("CHARGE", 0))
+        try:
+            charge = int(str(ch).replace("+", "")) if ch else 0
+        except (TypeError, ValueError):
+            charge = 0
+        peaks = spec.get("peaks", [])
+        spectra.append({
+            "peaks": peaks,
+            "precursor_mz": precursor_mz,
+            "rtinseconds": rtinseconds,
+            "scans": scans,
+            "charge": charge,
+        })
+    return spectra
+
+
+def read_spectra(filepath):
+    """
+    Read MS2 spectra from either an mzML or MGF file.
+    Returns list of dicts with keys: peaks, precursor_mz, rtinseconds, scans, charge.
+    Use this when the input may be either format (e.g. batch folder with .mzML or .mgf).
+    """
+    p = filepath.lower()
+    if p.endswith(".mgf"):
+        return read_mgf_spectra(filepath)
+    return read_mzml(filepath)
+
 
 def read_mzml_parallel(folder_path, max_workers=8):
     """
@@ -757,7 +829,7 @@ def write_singletons_mzml(scan_list, output_path, current_batch_folder, checkpoi
                 print(f"[Warning] File not found: {fp}, skipping scans: {scans}")
                 return results
             try:
-                spectra = read_mzml(fp)
+                spectra = read_spectra(fp)
                 scan_to_spectrum = {int(s['scans']): s for s in spectra}
                 for sc in scans:
                     scan_id = int(sc)
@@ -857,7 +929,7 @@ def write_mzml(cluster_dic, out_path, current_batch_folder, checkpoint_dir, samp
                 print(f"[Warning] File not found: {fp}, skipping scans: {scans}")
                 return results
             try:
-                spectra = read_mzml(fp)
+                spectra = read_spectra(fp)
                 # Create a mapping from scan_id to spectrum for O(1) lookup
                 scan_to_spectrum = {int(s['scans']): s for s in spectra}
                 for sc, out_id in scans:
@@ -996,6 +1068,24 @@ def _process_fetch_file(file_path, scan_pairs, temp_dir, current_batch_folder, c
     return None
 
 
+def _get_precursor_mz(spectrum):
+    """
+    Extract precursor m/z from spectrum dict with consistent fallback order.
+    MGF uses key 'pepmass' (read_mgf stores key.lower()); parquet stores 'precursor_mz'.
+    Used when writing mzML and when saving to consensus parquet so we never store 0
+    when the source has pepmass/PEPMASS from MGF.
+    """
+    raw = spectrum.get('pepmass', spectrum.get('PEPMASS', spectrum.get('precursor_mz',
+        spectrum.get('precursormz', spectrum.get('PRECURSORMZ', 0)))))
+    if isinstance(raw, str):
+        parts = raw.strip().split()
+        raw = float(parts[0]) if parts else 0
+    try:
+        return float(raw) if raw is not None and raw != '' else 0.0
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def _add_spectrum(experiment, sp_data, scan_id):
     """
     Helper to add a single MSSpectrum to an MSExperiment.
@@ -1006,7 +1096,7 @@ def _add_spectrum(experiment, sp_data, scan_id):
     s.setRT(float(sp_data.get('rtinseconds', 0)))
     s.setMSLevel(2)
     prec = oms.Precursor()
-    mz = float(sp_data.get('pepmass', sp_data.get('PEPMASS', sp_data.get('precursor_mz', 0))))
+    mz = _get_precursor_mz(sp_data)
     prec.setMZ(mz)
     ch_str = str(sp_data.get('charge', sp_data.get('CHARGE', '0'))).replace('+','')
     if ch_str.isdigit():
@@ -1353,9 +1443,16 @@ def load_cluster_dic_optimized(in_dir):
             if row.cluster_id in cluster_dic:
                 mz = np.frombuffer(row.spectrum_mz, dtype=np.float32)
                 intensity = np.frombuffer(row.spectrum_intensity, dtype=np.float32)
+                # If parquet had precursor_mz=0 (e.g. saved before we used _get_precursor_mz),
+                # fallback to first scan_list precursor_mz when available
+                prec_mz = float(row.precursor_mz)
+                if prec_mz <= 0.0:
+                    scan_list = cluster_dic[row.cluster_id].get('scan_list', [])
+                    if scan_list and len(scan_list[0]) >= 3:
+                        prec_mz = float(scan_list[0][2])  # (fp, sc, precursor_mz, rt)
                 cluster_dic[row.cluster_id]['spectrum'] = {
                     'peaks': list(zip(mz, intensity)),
-                    'precursor_mz': row.precursor_mz,
+                    'precursor_mz': prec_mz,
                     'rtinseconds': row.rtinseconds,
                     'charge': row.charge,
                     'title': row.title
@@ -1442,14 +1539,15 @@ def save_consensus_incremental(cluster_dic, consensus_parquet_path, max_existing
             peaks = np.array(spectrum['peaks'], dtype=np.float32)
             ch_str = str(spectrum.get('charge', '0')).replace('+', '')
             charge_val = int(ch_str) if ch_str.isdigit() else 0
-            
+            # Use same fallback as _add_spectrum (pepmass/PEPMASS from MGF) so we never write 0
+            precursor_mz = np.float32(_get_precursor_mz(spectrum))
             consensus_data.append({
                 "cluster_id": cid,
                 "filename": f"consensus_{cid}",
                 "scan": int(cid),
                 "spectrum_mz": peaks[:, 0].tobytes(),
                 "spectrum_intensity": peaks[:, 1].tobytes(),
-                "precursor_mz": np.float32(spectrum.get('precursor_mz', 0)),
+                "precursor_mz": precursor_mz,
                 "rtinseconds": np.float32(spectrum.get('rtinseconds', 0)),
                 "charge": np.int32(charge_val),
                 "title": str(spectrum.get('title', ''))
@@ -1756,7 +1854,7 @@ def cluster_one_folder(folder, checkpoint_dir, output_dir, tool_dir, precursor_t
             """Process all scans from a single file"""
             results = []
             try:
-                all_spectra = read_mzml(fp)
+                all_spectra = read_spectra(fp)
                 scan_to_spectrum = {int(s['scans']): s for s in all_spectra}
                 
                 for sc in scans:

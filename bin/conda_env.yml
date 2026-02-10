@@ -17,7 +17,8 @@ dependencies:
     - tqdm
     - psutil
     - h5py
-    - pyopenms==3.0.0
+    # 3.0.0 prints "term not found (MS:1000031)" when parsing some mzML; 3.2+ bundles newer PSI-MS CV
+    - pyopenms==3.2.0
     - spectrum-utils==0.3.5
     - pymzml
     - numcodecs

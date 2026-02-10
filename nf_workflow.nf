@@ -4,16 +4,17 @@ nextflow.enable.dsl=2
 params.input_spectra = "./data/round1"
 params.checkpoint_dir  = "./checkpoint"
 
-// Falcon parameters with defaults
+// Hyper-Spec / Falcon parameters with defaults
 params.precursor_tol = "20 ppm"
 params.fragment_tol = 0.05
 params.min_mz_range = 0
-params.min_mz = 0
-params.max_mz = 30000
-params.eps = 0.1
+// Hyper-Spec works best in a reasonable MS/MS range
+params.min_mz = 10
+params.max_mz = 2000
+params.eps = 0.5
 
-// Networking Parameters
-params.do_networking = "Yes"
+// Networking Parameters (set do_networking = "Yes" to run calculatePairs_index / GNPS networking)
+params.do_networking = "No"
 
 params.similarity = "gnps"
 
@@ -66,6 +67,7 @@ process CLUSTERING {
     file "results/*csv" optional true
     file "results/*feather" optional true
     file "results/*parquet" optional true
+    file "results/*mgf" optional true
     file "results/*txt" optional true
     file "results/*db" optional true
     file "results/*bin" optional true
@@ -81,7 +83,7 @@ process CLUSTERING {
     
     mkdir results
 
-    python3 $TOOL_FOLDER/incremental_clustering_sep_ver.py \
+    python3 $TOOL_FOLDER/incremental_clustering_hyper_spec.py \
         --folder $input \
         --checkpoint_dir "${params.checkpoint_dir}" \
         --output_dir results \
