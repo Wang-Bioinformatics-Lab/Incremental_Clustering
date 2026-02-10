@@ -16,7 +16,7 @@ DOCKER_IMAGE="hyperspec-docker-image"
 WORKFLOW_DIR="/Incremental_Clustering"
 
 # Hyper-Spec parameters (can be overridden via environment)
-EPS=${EPS:-0.3}
+EPS=${EPS:-0.6}
 MIN_MZ=${MIN_MZ:-10} 
 MAX_MZ=${MAX_MZ:-2000}
 PRECURSOR_TOL=${PRECURSOR_TOL:-"20 ppm"}

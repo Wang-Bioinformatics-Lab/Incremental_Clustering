@@ -181,40 +181,33 @@ The Dockerfile:
 
 ### 6.1. Build the image (using Makefile)
 
-From the **`docker-trial/`** directory:
+From the **`docker-trial/`** directory inside this repo:
 
 ```bash
-cd /data/nas-gpu/wang/xianghu/corteva_colab_project/Hyperspec-Building/docker-trial
+cd /path/to/Incremental_Clustering/docker-trial
 make build-docker
 ```
 
-This runs:
+This runs (from the repo root):
 
 ```bash
-cd .. && docker build -f docker-trial/Dockerfile -t my-docker-image .
+cd .. && docker build -f docker-trial/Dockerfile -t hyperspec-docker-image .
 ```
 
 So the resulting image name is:
 
-- `my-docker-image`
+- `hyperspec-docker-image`
 
 This should match the `DOCKER_IMAGE` variable in:
 
-- `Incremental_Clustering/scripts/run_multi_batch_incremental.sh`
+- `scripts/run_multi_batch_incremental.sh`
 
 ### 6.2. (Optional) Run interactive container for debugging
 
-You can start an interactive GPU container with the built image:
+You can start an interactive GPU container with the built image, for example:
 
 ```bash
-cd /data/nas-gpu/wang/xianghu/corteva_colab_project/Hyperspec-Building/docker-trial
-make run-docker-gpu
-```
-
-or equivalently:
-
-```bash
-docker run -it --gpus all my-docker-image /bin/bash
+docker run -it --gpus all hyperspec-docker-image /bin/bash
 ```
 
 Inside the container:
@@ -230,4 +223,26 @@ nextflow run ./nf_workflow.nf -resume -c nextflow.config --input_spectra ./data/
 ```
 
 or use the multi‑batch script via volume mounts as described in section 5.
+
+### 6.3. Cloning the correct branch for incremental Hyper‑Spec
+
+The incremental Hyper‑Spec workflow lives on the branch:
+
+- `Hyper_Spec_incremental_clustering`
+
+When you clone the GitHub repo, make sure you either:
+
+```bash
+git clone -b Hyper_Spec_incremental_clustering git@github.com:Wang-Bioinformatics-Lab/Incremental_Clustering.git
+```
+
+or:
+
+```bash
+git clone git@github.com:Wang-Bioinformatics-Lab/Incremental_Clustering.git
+cd Incremental_Clustering
+git checkout Hyper_Spec_incremental_clustering
+```
+
+Only this branch contains the full incremental Hyper‑Spec workflow, Docker setup, and multi‑batch scripts described above.
 
